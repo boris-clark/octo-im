@@ -5,7 +5,8 @@ Changes: paths come from --state-dir / --metrics / --log; failure classes are
 counted from the complete journal instead of the sampled deque; the PR58-only
 classes (stale_revision / revision_conflict / managed_channel 409, state:pending
 503 budget exhaustion) are gone because PR70 has no such responses; oracle
-verdicts are included. Per-node metric deltas are reported separately and are
+verdicts are included. Server logs are streamed line by line, never loaded
+whole. Per-node metric deltas are reported separately and are
 not summed across topologies.
 """
 import argparse
@@ -101,9 +102,12 @@ def main(argv=None):
 
     for lp in a.log:
         if os.path.exists(lp):
-            with open(lp, encoding="utf-8", errors="replace") as f:
-                txt = f.read()
-            counts = {m: txt.count(m) for m in LOG_MARKERS}
+            counts = {m: 0 for m in LOG_MARKERS}
+            with open(lp, encoding="utf-8", errors="replace") as f:  # streamed: full-hour multi-node logs
+                for line in f:
+                    for m in LOG_MARKERS:
+                        if m in line:
+                            counts[m] += line.count(m)
             summary.setdefault("logs", {})[lp] = counts
             print("\n=== LOG %s ===" % lp)
             for m, c in counts.items():
@@ -113,9 +117,13 @@ def main(argv=None):
         if name.startswith("oracle_") and name.endswith(".json"):
             with open(os.path.join(sd, name), encoding="utf-8") as f:
                 o = json.load(f)
+            cov = {k: v.get("ambiguous_ratio") for k, v in o.get("subscriber_coverage", {}).items()}
             summary.setdefault("oracle", {})[name] = {"verdict": o["verdict"], "fail": o["fail"],
-                                                      "read_errors": o["read_errors"]}
-            print("\n=== %s: %s fail=%s read_errors=%s" % (name, o["verdict"], o["fail"], o["read_errors"]))
+                                                      "read_errors": o["read_errors"],
+                                                      "scope_errors": o.get("scope_errors", {}),
+                                                      "ambiguous_ratio": cov, "leaders": o.get("leaders")}
+            print("\n=== %s: %s fail=%s read_errors=%s scope_errors=%s ambiguous_ratio=%s" % (
+                name, o["verdict"], o["fail"], o["read_errors"], o.get("scope_errors", {}), cov))
 
     if a.json_out:
         with open(a.json_out, "w", encoding="utf-8") as f:

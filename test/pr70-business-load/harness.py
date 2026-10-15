@@ -27,7 +27,7 @@ from wkload import HARNESS_VERSION  # noqa: E402
 from wkload.common import (OK, REJECTED, UNKNOWN, NOT_SENT, Client, Journal, Redactor,  # noqa: E402
                            read_token_file, split_endpoints, tool_hashes, write_json, read_json)
 from wkload.world import (ADD, REMOVE, SubscriberModel, addremove_stream, build_channels,  # noqa: E402
-                          seed_members, send_stream, upsert_stream)
+                          effect_of, seed_members, send_stream, upsert_stream)
 
 PAYLOAD = base64.b64encode(b"repro-load-message").decode()
 MEMBER_PAGE = 128
@@ -137,7 +137,7 @@ def do_seed(ctx):
             res = ctx.client.call("POST", base, "/channel/subscriber_add", body, timeout=a.budget + 2.0)
             M.record("seed", res, ctx.redact)
             for u in page:
-                model.apply(cid, u, ADD, res.outcome)
+                model.apply(cid, u, ADD, effect_of(res.outcome, res.status))
             journal.write({"t": round(res.t, 3), "dt": round(res.dt, 4), "kind": "seed", "ep": base, "ch": cid,
                            "ct": ctype, "page": pi, "n": len(page), "outcome": res.outcome, "http": res.status,
                            "err": res.err})
@@ -164,7 +164,7 @@ def addremove_worker(ctx, model, M, journal, wid, gwid):
             body["reset"] = 0
         with model.key_lock(cid, u):
             res = ctx.client.call("POST", base, path, body)
-            model.apply(cid, u, action, res.outcome)
+            model.apply(cid, u, action, effect_of(res.outcome, res.status))
         kind = "subscriber_add" if action == ADD else "subscriber_remove"
         M.record(kind, res, ctx.redact)
         journal.write({"t": round(res.t, 3), "dt": round(res.dt, 4), "kind": kind, "w": gwid, "ep": base,

@@ -1,6 +1,7 @@
 #!/bin/sh
-# Self-test: unit tests + red/green negative controls + full default-shape dry
-# runs (single node and three nodes) against disposable local mocks only.
+# Self-test: unit tests + red/green/limitation controls + mutation controls +
+# full default-shape dry runs (single node and three nodes) against disposable
+# local mocks only.
 # Usage: ./selftest.sh [dryrun-seconds]
 set -eu
 cd "$(dirname "$0")"
@@ -10,8 +11,12 @@ umask 077
 echo "== python: $(python3 -I -c 'import sys; print(sys.version.split()[0])')"
 echo "== verbatim originals"
 (cd original && shasum -a 256 -c SHA256SUMS)
+echo "== preserved evidence"
+(cd evidence && shasum -a 256 -c SHA256SUMS)
 echo "== unit tests and negative controls"
-python3 -I -m unittest discover -s tests -v
+python3 -I -W error::ResourceWarning -m unittest discover -s tests -v
+echo "== mutation controls (each mutation must be killed by the shipped tests)"
+python3 -I mock/mutation_controls.py --json-out "$WORK/mutation-controls.json"
 echo "== full default-shape dry run, 1 node, ${SECS}s load"
 python3 -I mock/fullscale_dryrun.py "$WORK/n1" "$SECS" 1
 echo "== full default-shape dry run, 3 nodes, ${SECS}s load"

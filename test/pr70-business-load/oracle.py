@@ -6,31 +6,52 @@ Replaces original/postcheck.py (sha256 219696f6...daa15), whose routes
 PR70 head or base. All checks read real server state; write receipts are never
 used as evidence of state.
 
-Modes (run in this order; --state-dir is shared with harness.py):
-  preflight  every API endpoint healthy; every dataset channel has 0 subscribers
-             and max_message_seq 0 (detects stale state from earlier runs)
-  seedcheck  subscriber sets equal the seeded world model           (0 -> 378)
+Modes (--state-dir is shared with harness.py; per-arm sequences are in README.md):
+  preflight  every API endpoint healthy; every dataset channel has an empty
+             subscriber set, an empty messagesync readback and max_message_seq 0
+             (detects stale state; max_message_seq alone answers 0 while a channel
+             config is not loaded, so the readback is the authoritative check)
+  seedcheck  subscriber sets match the seeded world model  (0 -> 378 subscriber sets)
   post       bounded drain until accepted messages are readable, subscriber
              sets vs final world model, probe send on every channel, full
              message readback/accounting, readback snapshot for restart
   restart    after a graceful restart (performed by the operator): health,
              subscriber sets, probe send on every channel, readback whose
              prefix is identical to the previous snapshot, full accounting
-  teardown   subscriber_remove_all on every channel, verify empty sets, probe
-             send on every channel, full accounting                 (378 -> 0)
+  teardown   subscriber_remove_all on every channel, subscriber sets vs the
+             model, probe send on every channel, full accounting
+             (378 -> 0 subscriber sets; channels and channel configs persist)
 
-Reads:
-  subscribers  GET <manager>/cluster/channels/<id>/<type>/subscribers on every
-               manager endpoint; every 200 answer must agree
-  messages     POST <api>/channel/messagesync (pull_mode 1, from seq 1, paged,
-               streamed page by page) and GET <api>/channel/max_message_seq
+Every mode first checks topology and records leaders:
+  topology   one --manager per --api, same node (GET /cluster/node ids), distinct
+             ids, and the set equals GET /cluster/nodes; anything else is a read
+             error (INCONCLUSIVE)
+  leaders    GET /cluster/channels/:id/:type/config on every node (not forwarded;
+             only the slot leader answers 200) records the serving slot leader and
+             channel leader of every channel in leaders_<mode>.json; restart modes
+             report how many slot leaders changed since the previous mode
+
+Reads (all leader-served on PR70; follower replica state is NOT observable):
+  subscribers  GET /cluster/channels/<id>/<type>/subscribers via every --manager
+               node; non-leaders forward to the slot leader, so every answer is the
+               slot leader's state. All answers must be identical (forwarding
+               consistency) and any node read error is a read error.
+  messages     POST <api[0]>/channel/messagesync (pull_mode 1, from seq 1, paged,
+               streamed); GET /channel/max_message_seq via every API node, answers
+               must agree
+
+Subscriber model: possible states per (channel, uid) (wkload/world.py). A uid
+must be present when P is its only possible state, absent when A is, and is
+unconstrained only when both are possible. The share of unconstrained keys is
+reported as the verdict scope; above --max-ambiguous-ratio (default 1%) the
+result is INCONCLUSIVE, never PASS.
 
 Memory is bounded for multi-million message runs: the send ledger is kept as
 per-worker byte/short arrays and the restart snapshot as a per-channel
 (count, sha256) pair.
 
-Verdict: FAIL if any check failed, INCONCLUSIVE if only read errors occurred,
-else PASS. Exit code 0 / 1 / 3. Unknown/rejected write outcomes are counted and
+Verdict: FAIL if any check failed, INCONCLUSIVE if only read errors or scope
+errors occurred, else PASS. Exit code 0 / 1 / 3. Unknown/rejected write outcomes are counted and
 reported, never folded into a pass.
 """
 import argparse
@@ -48,13 +69,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wkload import HARNESS_VERSION  # noqa: E402
 from wkload.common import (OK, REJECTED, UNKNOWN, NOT_SENT, Client, Redactor, read_journal,  # noqa: E402
                            read_token_file, split_endpoints, tool_hashes, write_json, read_json)
-from wkload.world import SubscriberModel, build_channels  # noqa: E402
+from wkload.world import SubscriberModel, build_channels, effect_of, possible  # noqa: E402
 
 LOAD_PAYLOAD = base64.b64encode(b"repro-load-message").decode()
 PROBE_PAYLOAD = base64.b64encode(b"postcheck-probe").decode()
 PAGE = 1000
 MAX_PAGES = 100000
 CODE = {OK: 1, REJECTED: 2, UNKNOWN: 3, NOT_SENT: 4}
+OBSERVATION_LIMITS = [
+    "All public read routes are served by the leader: subscriber reads by the slot leader "
+    "(non-leaders forward, api_channel.go:242-268), messagesync and max_message_seq by the channel "
+    "leader. Replica-local state of followers is not observable and is not verified.",
+    "Cross-node checks verify forwarding consistency: every configured node must return the same "
+    "answer; a node read error makes the result INCONCLUSIVE.",
+    "The serving slot/channel leader of every channel is recorded per mode (leaders_<mode>.json); "
+    "restart modes report how many slot leaders changed since the previous mode.",
+    "0 -> 378 -> 0 refers to subscriber sets. Channels and channel cluster configs are never deleted.",
+]
 OUTCOME = {v: k for k, v in CODE.items()}
 
 
@@ -160,12 +191,15 @@ class Oracle:
         self.managers = split_endpoints(a.manager)
         if not self.apis or not self.managers:
             raise SystemExit("--api and --manager are required")
+        self.node_ids = {}  # api endpoint -> node id reported by GET /cluster/node
         self.client = Client(self.token, a.read_timeout)
         self.channels = build_channels(a.groups, a.children, a.channel_prefix)
         os.makedirs(a.state_dir, exist_ok=True)
         self.fail = defaultdict(int)
         self.info = defaultdict(int)
         self.read_errors = defaultdict(int)
+        self.scope_errors = defaultdict(int)
+        self.coverage = {}
         self.examples = defaultdict(list)
 
     # ---------- bookkeeping ----------
@@ -182,7 +216,7 @@ class Oracle:
     def verdict(self):
         if any(self.fail.values()):
             return "FAIL"
-        if any(self.read_errors.values()):
+        if any(self.read_errors.values()) or any(self.scope_errors.values()):
             return "INCONCLUSIVE"
         return "PASS"
 
@@ -200,39 +234,138 @@ class Oracle:
                 self.bad("unhealthy_endpoint", {"ep": ep, "http": r.status, "err": r.err})
         return out
 
+    def topology(self):
+        """Fail closed unless the configured endpoints cover the whole cluster, one node each.
+
+        --api[i] and --manager[i] must be the same node (GET /cluster/node ids match),
+        node ids must be distinct, and their set must equal the node list reported by
+        GET /cluster/nodes (which also lists offline nodes)."""
+        out = {"api": {}, "manager": {}, "cluster_nodes": None}
+        if len(self.managers) != len(self.apis):
+            self.rerr("endpoint_mapping_incomplete", {"api": len(self.apis), "manager": len(self.managers)})
+        for i, ep in enumerate(self.apis):
+            r = self.client.call("GET", ep, "/cluster/node")
+            j = r.json() if r.outcome == OK else None
+            if isinstance(j, dict) and isinstance(j.get("id"), int):
+                self.node_ids[ep] = j["id"]
+                out["api"][ep] = j["id"]
+            else:
+                self.rerr("node_identity", {"ep": ep, "http": r.status, "err": r.err})
+            if i < len(self.managers):
+                m = self.managers[i]
+                r = self.client.call("GET", m, "/cluster/node")
+                jm = r.json() if r.outcome == OK else None
+                mid = jm.get("id") if isinstance(jm, dict) else None
+                out["manager"][m] = mid
+                if mid is None:
+                    self.rerr("node_identity", {"ep": m, "http": r.status, "err": r.err})
+                elif ep in self.node_ids and mid != self.node_ids[ep]:
+                    self.rerr("endpoint_mapping_mismatch", {"api": ep, "api_node": self.node_ids[ep],
+                                                            "manager": m, "manager_node": mid})
+        ids = list(self.node_ids.values())
+        if len(set(ids)) != len(ids):
+            self.rerr("endpoint_mapping_duplicate_node", {"ids": ids})
+        cluster = None
+        for ep in self.apis:
+            r = self.client.call("GET", ep, "/cluster/nodes")
+            j = r.json() if r.outcome == OK else None
+            if isinstance(j, dict) and isinstance(j.get("data"), list):
+                cluster = sorted(n.get("id") for n in j["data"] if isinstance(n, dict))
+                break
+        out["cluster_nodes"] = cluster
+        if cluster is None:
+            self.rerr("cluster_nodes_unreadable", {})
+        elif sorted(set(ids)) != cluster:
+            self.rerr("topology_incomplete", {"configured_node_ids": sorted(set(ids)), "cluster_node_ids": cluster})
+        return out
+
+    def leaders(self, label):
+        """Record which node served the leader-routed reads of each channel.
+
+        GET /cluster/channels/:id/:type/config is not forwarded: a non-leader answers
+        400 "slot leader is not current node" (api_cluster.go:122-164). Exactly one
+        configured node must claim each channel; its 200 body carries the channel
+        leader as "learder_id" (field name as spelled in pkg/wkdb/model.go:484)."""
+        res = {}
+        for cid, ctype, _g in self.channels:
+            claim = []
+            ch_leader = None
+            for ep in self.apis:
+                r = self.client.call("GET", ep, "/cluster/channels/%s/%d/config" % (cid, ctype))
+                if r.outcome == OK:
+                    j = r.json() or {}
+                    claim.append(self.node_ids.get(ep, ep))
+                    ch_leader = j.get("learder_id")
+                elif r.status == 400 and b"slot leader is not current node" in r.body:
+                    continue
+                elif r.status == 400 and b"slot not found" not in r.body:
+                    claim.append(self.node_ids.get(ep, ep))  # slot leader without a loaded channel config
+                else:
+                    self.rerr("leader_identification", {"ch": cid, "ep": ep, "http": r.status, "err": r.err})
+                    claim = None
+                    break
+            if claim is None:
+                continue
+            if len(claim) != 1:
+                self.rerr("leader_identification", {"ch": cid, "claimants": claim})
+                continue
+            res[cid] = {"slot_leader": claim[0], "channel_leader": ch_leader}
+        path_last = os.path.join(self.a.state_dir, "leaders_last.json")
+        summary = {"label": label,
+                   "slot_leader_counts": dict(sorted(_count(v["slot_leader"] for v in res.values()).items())),
+                   "channel_leader_counts": dict(sorted(_count(v["channel_leader"] for v in res.values()).items())),
+                   "channels_identified": len(res)}
+        if os.path.exists(path_last):
+            prev = read_json(path_last)
+            summary["previous_label"] = prev["label"]
+            summary["slot_leader_changed_vs_previous"] = sum(
+                1 for c, v in res.items() if c in prev["leaders"] and prev["leaders"][c]["slot_leader"] != v["slot_leader"])
+        write_json(os.path.join(self.a.state_dir, "leaders_%s.json" % label), {"label": label, "leaders": res})
+        write_json(path_last, {"label": label, "leaders": res})
+        return summary
+
     def subscribers(self, cid, ctype):
-        """Returns sorted list from the agreeing nodes, or None on read error."""
+        """Subscriber list as served through every configured node.
+
+        On PR70 a non-leader forwards this read to the slot leader, so every answer
+        is the slot leader's local state: this checks forwarding consistency, not
+        replica-local state. Any node read error fails closed (INCONCLUSIVE)."""
         answers = {}
-        errs = {}
         for ep in self.managers:
             r = self.client.call("GET", ep, "/cluster/channels/%s/%d/subscribers" % (cid, ctype))
             j = r.json() if r.outcome == OK else None
             if isinstance(j, list) and all(isinstance(x, str) for x in j):
                 answers[ep] = j
             else:
-                errs[ep] = r.err or "bad_body"
-        for ep in errs:
-            self.info["subscriber_read_node_error:" + ep] += 1
+                self.rerr("subscriber_read_node_error", {"ch": cid, "ep": ep, "http": r.status, "err": r.err})
         if not answers:
-            self.rerr("subscribers", {"ch": cid, "errors": errs})
             return None
         vals = list(answers.values())
         canon = sorted(vals[0])
         for v in answers.values():
             if sorted(v) != canon:
-                self.bad("divergent_subscriber_read", {"ch": cid, "nodes": {k: len(x) for k, x in answers.items()}})
+                self.bad("forwarded_read_mismatch", {"ch": cid, "route": "subscribers",
+                                                     "nodes": {k: len(x) for k, x in answers.items()}})
                 break
         if len(vals[0]) != len(set(vals[0])):
             self.bad("duplicate_subscriber", {"ch": cid, "n": len(vals[0]), "distinct": len(set(vals[0]))})
         return canon
 
     def max_seq(self, cid, ctype):
-        r = self.client.call("GET", self.apis[0], "/channel/max_message_seq?channel_id=%s&channel_type=%d" % (cid, ctype))
-        j = r.json() if r.outcome == OK else None
-        if not isinstance(j, dict) or not isinstance(j.get("message_seq"), int):
-            self.rerr("max_message_seq", {"ch": cid, "http": r.status, "err": r.err})
+        """max_message_seq through every API node; all answers must agree (forwarded to leader)."""
+        vals = {}
+        for ep in self.apis:
+            r = self.client.call("GET", ep, "/channel/max_message_seq?channel_id=%s&channel_type=%d" % (cid, ctype))
+            j = r.json() if r.outcome == OK else None
+            if not isinstance(j, dict) or not isinstance(j.get("message_seq"), int):
+                self.rerr("max_message_seq", {"ch": cid, "ep": ep, "http": r.status, "err": r.err})
+            else:
+                vals[ep] = j["message_seq"]
+        if not vals:
             return None
-        return j["message_seq"]
+        if len(set(vals.values())) > 1:
+            self.bad("forwarded_read_mismatch", {"ch": cid, "route": "max_message_seq", "nodes": vals})
+        return vals.get(self.apis[0], next(iter(vals.values())))
 
     def pages(self, cid, ctype, start=1, quiet=False):
         """Streams message pages from `start`. Yields lists; yields None once on read error.
@@ -263,27 +396,55 @@ class Oracle:
 
     # ---------- checks ----------
     def check_subscribers(self, model, label):
-        exp_total = 0
+        """Compare every channel's served subscriber set with the possible-state model.
+
+        A uid is required present if P is its only possible state, required absent if A
+        is (every uid the model does not track is certainly absent), and unconstrained
+        only when both are possible. The share of unconstrained keys is the verdict
+        scope; above --max-ambiguous-ratio the result cannot be PASS."""
+        certain_p = certain_a = ambiguous = amb_present = 0
+        read = 0
         for cid, ctype, _g in self.channels:
             actual = self.subscribers(cid, ctype)
             if actual is None:
                 continue
+            read += 1
             act = set(actual)
-            conf = model.confirmed.get(cid, set())
-            unc = model.uncertain.get(cid, set())
-            must = conf - unc
-            allowed = conf | unc
-            exp_total += len(must)
-            missing = must - act
-            extra = act - allowed
+            missing, extra = [], []
+            seen = set()
+            for u, code in model.items(cid):
+                seen.add(u)
+                ps = possible(code)
+                if ps == {"P"}:
+                    certain_p += 1
+                    if u not in act:
+                        missing.append(u)
+                elif ps == {"A"}:
+                    certain_a += 1
+                    if u in act:
+                        extra.append(u)
+                else:
+                    ambiguous += 1
+                    amb_present += u in act
+            extra.extend(u for u in act if u not in seen)  # never touched: certainly absent
             if missing:
                 self.bad("missing_subscriber", {"ch": cid, "n": len(missing), "uids": sorted(missing)[:10]}, len(missing))
             if extra:
                 self.bad("unexpected_subscriber", {"ch": cid, "n": len(extra), "uids": sorted(extra)[:10]}, len(extra))
-            self.info["uncertain_uid_present"] += len(unc & act)
-            self.info["uncertain_uid_absent"] += len(unc - act)
             self.info["subscribers_read_total"] += len(act)
-        self.info["subscribers_expected_certain_" + label] = exp_total
+        tracked = certain_p + certain_a + ambiguous
+        ratio = (ambiguous / tracked) if tracked else 0.0
+        cov = {"label": label, "channels_read": read, "touched_keys": tracked, "certain_present_keys": certain_p,
+               "certain_absent_touched_keys": certain_a, "ambiguous_keys": ambiguous,
+               "ambiguous_present": amb_present, "ambiguous_absent": ambiguous - amb_present,
+               "ambiguous_ratio": round(ratio, 6), "max_ambiguous_ratio": self.a.max_ambiguous_ratio,
+               "scope": "PASS asserts presence of %d certain-present keys and absence of every other uid except "
+                        "%d ambiguous keys (%.4f%% of %d touched keys), whose presence is not asserted"
+                        % (certain_p, ambiguous, 100 * ratio, tracked)}
+        self.coverage[label] = cov
+        if ratio > self.a.max_ambiguous_ratio:
+            self.scope_errors["ambiguous_ratio_above_threshold"] += 1
+            self.examples["scope_error"].append(cov)
 
     def scan_channel(self, cid, ctype, ledger, seen, snap=None, probe_label=None):
         """Full streamed readback + checks for one channel.
@@ -434,6 +595,13 @@ class Oracle:
         return os.path.join(self.a.state_dir, "readback_snapshot.json")
 
 
+def _count(it):
+    out = defaultdict(int)
+    for x in it:
+        out[str(x)] += 1
+    return out
+
+
 def model_from(state_dir, name):
     return SubscriberModel.from_json(read_json(os.path.join(state_dir, name))["model"])
 
@@ -450,12 +618,25 @@ def check(o, a):
     rep = {"harness_version": HARNESS_VERSION, "tool_sha256": tool_hashes(), "mode": a.mode,
            "started_at": time.time(), "n_channels": len(o.channels), "api": o.apis, "manager": o.managers}
     rep["health"] = o.health()
+    rep["topology"] = o.topology()
+    label = a.mode if a.mode != "restart" else "restart%d" % a.restart_index
+    rep["leaders"] = o.leaders(label)
 
     if a.mode == "preflight":
+        # max_message_seq answers 0 while a channel config is not loaded (LeaderOfChannelForRead),
+        # so stale messages are looked for with a real messagesync readback as well. Disclosed
+        # side effect: messagesync creates the channel cluster config (GetOrCreate...FromSlotLeader).
         for cid, ctype, _g in o.channels:
             s = o.subscribers(cid, ctype)
             if s:
                 o.bad("stale_state_subscribers", {"ch": cid, "n": len(s)})
+            n = 0
+            for page in o.pages(cid, ctype):
+                if page is None:
+                    break
+                n += len(page)
+            if n:
+                o.bad("stale_state_messages", {"ch": cid, "messages": n})
             ms = o.max_seq(cid, ctype)
             if ms:
                 o.bad("stale_state_messages", {"ch": cid, "max_message_seq": ms})
@@ -484,28 +665,31 @@ def check(o, a):
             r = o.client.call("POST", o.apis[0], "/channel/subscriber_remove_all",
                               {"channel_id": cid, "channel_type": ctype}, timeout=a.write_timeout)
             out[r.outcome] += 1
-            model.remove_all(cid, r.outcome)
+            model.remove_all(cid, effect_of(r.outcome, r.status))
             if r.outcome != OK:
                 o.bad("teardown_not_ok", {"ch": cid, "http": r.status, "err": r.err})
         rep["teardown_outcomes"] = dict(out)
         write_json(os.path.join(a.state_dir, "world_teardown.json"), {"model": model.to_json()}, o.redact)
-        for cid, ctype, _g in o.channels:
-            s = o.subscribers(cid, ctype)
-            if s:
-                o.bad("not_empty_after_teardown", {"ch": cid, "n": len(s)}, len(s))
+        # 378 -> 0 means subscriber sets: channels and channel cluster configs persist (no delete route used)
+        o.check_subscribers(model, "teardown")
         rep["probe"] = o.probe("teardown")
         o.account("teardown")
 
     rep["verdict"] = o.verdict()
     rep["fail"] = dict(o.fail)
     rep["read_errors"] = dict(o.read_errors)
+    rep["scope_errors"] = dict(o.scope_errors)
+    rep["subscriber_coverage"] = o.coverage
+    rep["observation_limits"] = OBSERVATION_LIMITS
     rep["info"] = dict(o.info)
     rep["examples"] = {k: v for k, v in o.examples.items()}
     rep["finished_at"] = time.time()
     name = a.mode if a.mode != "restart" else "restart%d" % a.restart_index
     write_json(os.path.join(a.state_dir, "oracle_%s.json" % name), rep, o.redact)
     print(o.redact(json.dumps({"mode": name, "verdict": rep["verdict"], "fail": rep["fail"],
-                               "read_errors": rep["read_errors"]})), flush=True)
+                               "read_errors": rep["read_errors"], "scope_errors": rep["scope_errors"],
+                               "ambiguous_ratio": {k: v["ambiguous_ratio"] for k, v in o.coverage.items()}})),
+          flush=True)
     return {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 3}[rep["verdict"]]
 
 
@@ -526,6 +710,9 @@ def parse_args(argv=None):
     ap.add_argument("--drain-timeout", type=float, default=600.0)
     ap.add_argument("--drain-interval", type=float, default=5.0)
     ap.add_argument("--restart-index", type=int, default=1)
+    ap.add_argument("--max-ambiguous-ratio", type=float, default=0.01,
+                    help="pre-declared verdict scope: above this share of ambiguous subscriber keys the "
+                         "result is INCONCLUSIVE instead of PASS")
     a = ap.parse_args(argv)
     if not a.run_id.isalnum():
         ap.error("--run-id must be alphanumeric")

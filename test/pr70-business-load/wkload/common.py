@@ -162,19 +162,39 @@ class Client:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["token"] = self.token
+        # The timeout is one wall-clock deadline for the whole request (connect, send,
+        # headers and body), not a per-socket-operation idle timeout: before every
+        # blocking step the socket timeout is set to the time remaining.
+        deadline = t0 + c.timeout
+
+        def arm():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("whole-request deadline exceeded")
+            c.sock.settimeout(left)
+
         if c.sock is None:
             try:
                 c.connect()
-                c.sock.settimeout(c.timeout)
+                arm()
             except Exception as e:  # nothing was sent
                 self._drop(base)
                 return Result(None, b"", time.monotonic() - t0, NOT_SENT, classify_error(None, b"", e), t_wall)
-        else:
-            c.sock.settimeout(c.timeout)
         try:
+            arm()
             c.request(method, path, body=data, headers=headers)
+            arm()
             r = c.getresponse()
-            body = r.read()
+            chunks = []
+            while True:
+                arm()
+                chunk = r.read1(65536)  # returns what is available, so a trickling body cannot extend the deadline
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            arm()
+            chunks.append(r.read())  # zero-length final read marks the response closed for keep-alive reuse
+            body = b"".join(chunks)
         except Exception as e:
             self._drop(base)
             return Result(None, b"", time.monotonic() - t0, UNKNOWN, classify_error(None, b"", e), t_wall)

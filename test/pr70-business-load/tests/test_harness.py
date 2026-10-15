@@ -72,8 +72,8 @@ class Base(unittest.TestCase):
                 "--budget", budget] + SMALL + list(extra)
         return quiet(harness.main, argv)
 
-    def o(self, mode, *extra):
-        argv = [mode, "--api", self.cluster.urls("api"), "--manager", self.cluster.urls("manager"),
+    def o(self, mode, *extra, api=None, manager=None):
+        argv = [mode, "--api", api or self.cluster.urls("api"), "--manager", manager or self.cluster.urls("manager"),
                 "--token-file", self.tok, "--state-dir", self.st, "--drain-timeout", "3",
                 "--drain-interval", "0.2"] + SMALL + list(extra)
         rc = quiet(oracle.run, oracle.parse_args(argv))
@@ -153,6 +153,28 @@ class TestDeterminism(unittest.TestCase):
         outs = {subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,
                                env={"PYTHONHASHSEED": s}).stdout for s in ("1", "2")}
         self.assertEqual(len(outs), 1)
+
+    def test_addremove_stream_identical_to_6255599a(self):
+        """The compact remove pool consumes the RNG exactly like the reviewed implementation."""
+        def v1(seed, wid, channels, pm, cm):
+            r = world.worker_rng(seed, "addremove", wid)
+            added = {}
+            while True:
+                cid, ctype, _g = r.choice(channels)
+                if r.random() < 0.5:
+                    u = world.uid(r.randrange(world.UID_SPACE))
+                    added.setdefault(cid, []).append(u)
+                    yield cid, ctype, world.ADD, u
+                else:
+                    pool = world.seed_members(ctype, pm, cm) + added.get(cid, [])
+                    yield cid, ctype, world.REMOVE, r.choice(pool)
+        ch = world.build_channels(42, 8)
+        for wid in (0, 13, 41):
+            self.assertEqual(self.take(world.addremove_stream(42, wid, ch, 150, 20), 20000),
+                             self.take(v1(42, wid, ch, 150, 20), 20000))
+        small = world.build_channels(1, 1)  # dense: most removes hit previously added uids
+        self.assertEqual(self.take(world.addremove_stream(7, 3, small, 150, 20), 20000),
+                         self.take(v1(7, 3, small, 150, 20), 20000))
 
     def test_no_shared_global_rng(self):
         pat = re.compile(r"\brandom\.(random|randint|choice|randrange|seed|shuffle|sample)\(")
@@ -304,14 +326,148 @@ class TestRedDuplicateSubscriber(Base):
         self.assertEqual(rep["fail"], {"duplicate_subscriber": 6})
 
 
-class TestRedDivergentNode(Base):
+# ---------------- B1: topology coverage, fail-closed node reads, forwarding limits ----------------
+
+def free_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+class TestB1OmittedManagerIsInconclusive(Base):
+    """Reviewer X0: diverged node left out of --manager used to PASS."""
+    nodes = 3
+    faults = {"diverge_node": 1, "leader_override": 0}
+
+    def test(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        mg = self.cluster.urls("manager").split(",")
+        rc, rep = self.o("seedcheck", manager=mg[0] + "," + mg[2])
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+        self.assertIn("endpoint_mapping_incomplete", rep["read_errors"])
+
+    def test_node_omitted_from_both_lists(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        ap, mg = self.cluster.urls("api").split(","), self.cluster.urls("manager").split(",")
+        rc, rep = self.o("seedcheck", api=ap[0] + "," + ap[2], manager=mg[0] + "," + mg[2])
+        self.assertEqual(rep["verdict"], "INCONCLUSIVE")
+        self.assertIn("topology_incomplete", rep["read_errors"])
+
+    def test_swapped_manager_order(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        mg = self.cluster.urls("manager").split(",")
+        rc, rep = self.o("seedcheck", manager=",".join([mg[1], mg[0], mg[2]]))
+        self.assertEqual(rep["verdict"], "INCONCLUSIVE")
+        self.assertIn("endpoint_mapping_mismatch", rep["read_errors"])
+
+
+class TestB1UnreachableNodeIsInconclusive(Base):
+    """Reviewer X1: diverged node whose manager is unreachable used to PASS (info only)."""
+    nodes = 3
+    faults = {"diverge_node": 1, "leader_override": 0}
+
+    def test_unreachable_manager(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        mg = self.cluster.urls("manager").split(",")
+        mg[1] = "http://127.0.0.1:%d" % free_port()
+        rc, rep = self.o("seedcheck", manager=",".join(mg))
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+        self.assertEqual(rep["read_errors"]["subscriber_read_node_error"], 6)
+
+    def test_node_down(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        self.cluster.stop_node(1)
+        ap = ",".join(self.cluster.state.api_urls)
+        mg = self.cluster.urls("manager").split(",")
+        mg.insert(1, "http://127.0.0.1:%d" % free_port())
+        rc, rep = self.o("seedcheck", api=ap, manager=",".join(mg))
+        # a fully stopped node also fails /health, which is a FAIL; never PASS
+        self.assertEqual((rc, rep["verdict"]), (1, "FAIL"))
+        self.assertEqual(rep["fail"], {"unhealthy_endpoint": 1})
+        self.assertIn("node_identity", rep["read_errors"])
+        self.assertIn("subscriber_read_node_error", rep["read_errors"])
+
+
+class TestB1LeaderDivergenceFails(Base):
+    """A node that leads channels and holds wrong state is caught through every route."""
     nodes = 3
     faults = {"diverge_node": 1}
 
     def test(self):
         self.assertEqual(self.h("--phase", "seed"), 0)
         rc, rep = self.o("seedcheck")
-        self.assertEqual(rep["fail"], {"divergent_subscriber_read": 6})
+        self.assertEqual(rep["verdict"], "FAIL")
+        led = rep["leaders"]["slot_leader_counts"].get("2", 0)
+        self.assertGreater(led, 0)
+        self.assertEqual(rep["fail"], {"missing_subscriber": led})
+        self.assertEqual(sum(rep["leaders"]["slot_leader_counts"].values()), 6)
+
+
+class TestB1ReplicaLocalDivergenceIsAnObservationLimit(Base):
+    """Follower-only divergence is invisible through PR70 public reads: PASS, and the
+    report says so instead of claiming replica verification."""
+    nodes = 3
+    faults = {"diverge_node": 1, "leader_override": 0}
+
+    def test(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        rc, rep = self.o("seedcheck")
+        self.assertEqual(rep["verdict"], "PASS", rep)
+        self.assertEqual(rep["leaders"]["slot_leader_counts"], {"1": 6})
+        self.assertTrue(any("not observable" in x for x in rep["observation_limits"]))
+
+
+class TestB1StaleRouteMismatchFails(Base):
+    """A node that answers locally instead of forwarding is caught as a forwarding mismatch."""
+    nodes = 3
+    faults = {"diverge_node": 1, "leader_override": 0, "stale_route_node": 1}
+
+    def test(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        rc, rep = self.o("seedcheck")
+        self.assertEqual(rep["fail"], {"forwarded_read_mismatch": 6})
+
+
+class TestB1LeadersRecordedAcrossRestart(Base):
+    nodes = 3
+
+    def test(self):
+        self.full_green()
+        self.cluster.state.faults["leader_override"] = 2  # every slot moves to node 3 across the restart
+        self.cluster = self.cluster.graceful_restart()
+        rc, rep = self.o("restart")
+        self.assertEqual(rep["verdict"], "PASS", rep)
+        self.assertEqual(rep["leaders"]["previous_label"], "post")
+        self.assertEqual(rep["leaders"]["slot_leader_counts"], {"3": 6})
+        moved = sum(1 for c in _json(os.path.join(self.st, "leaders_post.json"))["leaders"].values()
+                    if c["slot_leader"] != 3)
+        self.assertEqual(rep["leaders"]["slot_leader_changed_vs_previous"], moved)
+        self.assertTrue(os.path.exists(os.path.join(self.st, "leaders_restart1.json")))
+
+
+class TestMockForwardsLikeProduct(Base):
+    nodes = 3
+
+    def test(self):
+        from wkload.common import Client
+        c = Client(TOKEN, 5)
+        st = self.cluster.state
+        apis = st.api_urls
+        cid = next(x for x in ("a%d" % i for i in range(100)) if st.leader(x) == 2)
+        r = c.call("POST", apis[0], "/channel/subscriber_add", {"channel_id": cid, "channel_type": 2, "subscribers": ["u1"]})
+        self.assertEqual(r.outcome, "ok")
+        self.assertEqual(st.subs[(cid, 2)], {"u1"})
+        r = c.call("GET", apis[0], "/cluster/channels/%s/2/config" % cid)
+        self.assertEqual((r.status, r.json()["msg"]), (400, "slot leader is not current node"))
+        r = c.call("GET", apis[1], "/cluster/channels/%s/2/subscribers" % cid)
+        self.assertEqual(r.json(), ["u1"])
+        r = c.call("POST", apis[0], "/channel/info", {"channel_id": cid, "channel_type": 2, "large": 1})
+        self.assertEqual(st.info[(cid, 2)], {"large": True, "ban": False, "disband": False, "send_ban": False,
+                                            "allow_stranger": False})
+        c.close_all()
 
 
 class TestRedMissingMessage(Base):
@@ -338,6 +494,16 @@ class TestRedSeqGap(Base):
     def test(self):
         rc, rep = self.full_green()
         self.assertEqual(rep["fail"], {"seq_gap": 1})
+
+
+class TestRedSeqGapMidChannel(Base):
+    """Gap after a channel's first message: exercises the contiguity check, not the first-seq check."""
+    faults = {"seq_gap_mid_channel": True}
+
+    def test(self):
+        rc, rep = self.full_green()
+        self.assertEqual(rep["fail"], {"seq_gap": 1})
+        self.assertIn("prev", rep["examples"]["seq_gap"][0])
 
 
 class TestRedRejectedButPersisted(Base):
@@ -390,9 +556,25 @@ class TestReadFailureIsInconclusiveNotPass(Base):
     faults = {"messagesync_500": True}
 
     def test(self):
-        rc, rep = self.full_green()
+        rc, rep = self.o("preflight")
         self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
         self.assertEqual(rep["read_errors"], {"messagesync": 6})
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        self.assertEqual(self.h("--phase", "load", *SMALL_LOAD), 0)
+        rc, rep = self.o("post")
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+        self.assertEqual(rep["read_errors"], {"messagesync": 6})
+
+
+class TestN3StaleMessagesWithUnloadedConfig(Base):
+    """max_message_seq answers 0 while the channel config is not loaded; readback still finds it."""
+    faults = {"stale_message_channel": "repro_g002"}
+
+    def test(self):
+        rc, rep = self.o("preflight")
+        self.assertEqual(rep["verdict"], "FAIL")
+        self.assertEqual(rep["fail"]["stale_state_messages"], 2)  # readback, then max seq once the config is loaded
+        self.assertEqual(rep["examples"]["stale_state_messages"][0], {"ch": "repro_g002", "messages": 1})
 
 
 # ---------------- client failures: outcomes retained and accounted, no false verdict ----------------
@@ -406,9 +588,28 @@ class TestClientTimeoutsAccounted(Base):
         final = _json(os.path.join(self.st, "world_final.json"))["final"]
         unknown = sum(v["outcome"]["unknown"] for v in final["kinds"].values())
         self.assertGreater(unknown, 0)
-        self.assertEqual(rep["verdict"], "PASS", rep)
-        model = _json(os.path.join(self.st, "world_final.json"))["model"]
-        self.assertGreater(sum(len(v) for v in model["uncertain"].values()), 0)
+        # broad ambiguity cannot masquerade as full consistency
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"), rep)
+        self.assertEqual(rep["fail"], {})
+        self.assertEqual(rep["scope_errors"], {"ambiguous_ratio_above_threshold": 1})
+        cov = rep["subscriber_coverage"]["post"]
+        self.assertGreater(cov["ambiguous_ratio"], 0.01)
+        # with an explicitly widened scope the same state is consistent (no false FAIL)
+        argv_rep = self.o("teardown", "--max-ambiguous-ratio", "1.0")[1]
+        self.assertEqual((argv_rep["verdict"], argv_rep["fail"]), ("PASS", {}), argv_rep)
+
+
+class TestN4WholeRequestDeadline(Base):
+    faults = {"trickle_secs": 3.0}
+
+    def test(self):
+        from wkload.common import Client
+        c = Client(TOKEN, 1.0)
+        r = c.call("POST", self.cluster.urls("api"), "/channel/info",
+                   {"channel_id": "x1", "channel_type": 2, "large": 1})
+        c.close_all()
+        self.assertEqual((r.outcome, r.err), ("unknown", "client_timeout"))
+        self.assertLess(r.dt, 1.5)
 
 
 class TestRejectedWritesAccounted(Base):
@@ -418,7 +619,7 @@ class TestRejectedWritesAccounted(Base):
         self.assertEqual(self.o("preflight")[1]["verdict"], "PASS")
         self.h("--phase", "seed", "--continue-on-seed-failure")
         self.assertEqual(self.h("--phase", "load", *SMALL_LOAD), 0)
-        rc, rep = self.o("post")
+        rc, rep = self.o("post", "--max-ambiguous-ratio", "1.0")
         final = _json(os.path.join(self.st, "world_final.json"))["final"]
         rejected = sum(v["outcome"]["rejected"] for v in final["kinds"].values())
         self.assertGreater(rejected, 0)
@@ -426,10 +627,141 @@ class TestRejectedWritesAccounted(Base):
         for v in final["kinds"].values():
             errs |= set(v["err"])
         self.assertEqual(errs, {"http_500"})
-        # applied-then-500 writes are uncertain in the model, so no false missing/unexpected verdict
-        self.assertNotIn("missing_subscriber", rep["fail"])
-        self.assertNotIn("unexpected_subscriber", rep["fail"])
-        self.assertNotIn("rejected_but_persisted", rep["fail"])
+        # applied-then-500 writes are ambiguous in the model, so no false missing/unexpected verdict;
+        # the only allowed failure is an oracle probe send that itself drew an injected 500
+        self.assertLessEqual(set(rep["fail"]), {"probe_send_not_ok"})
+        self.assertGreater(rep["subscriber_coverage"]["post"]["ambiguous_keys"], 0)
+
+
+# ---------------- B2: possible-state model per (channel, uid) ----------------
+
+class TestB2Transitions(unittest.TestCase):
+    """Pure model transitions, including the reviewer reproducer and ordering cases."""
+
+    def poss(self, *writes, seed_present=False):
+        m = world.SubscriberModel()
+        if seed_present:
+            m.apply("c", "u00001", world.ADD, world.APPLIED)
+        for action, outcome, status in writes:
+            m.apply("c", "u00001", action, world.effect_of(outcome, status))
+        return world.possible(m.code("c", "u00001"))
+
+    def test_effect_mapping(self):
+        self.assertEqual(world.effect_of("ok", 200), world.APPLIED)
+        self.assertEqual(world.effect_of("not_sent", None), world.NO_EFFECT)
+        self.assertEqual(world.effect_of("rejected", 401), world.NO_EFFECT)
+        for o, st in (("rejected", 400), ("rejected", 500), ("unknown", None)):
+            self.assertEqual(world.effect_of(o, st), world.AMBIGUOUS)
+
+    def test_table(self):
+        A, R = world.ADD, world.REMOVE
+        cases = [
+            # (seed_present, writes, expected possible states)
+            (True, [(A, "rejected", 400)], {"P"}),                     # reviewer X2: add cannot remove
+            (True, [(A, "unknown", None)], {"P"}),
+            (True, [(R, "rejected", 400)], {"P", "A"}),
+            (True, [(R, "not_sent", None)], {"P"}),                    # definite non-admission
+            (True, [(R, "rejected", 401)], {"P"}),
+            (False, [(R, "unknown", None)], {"A"}),                    # remove cannot add
+            (False, [(A, "unknown", None)], {"P", "A"}),
+            (False, [(A, "rejected", 401)], {"A"}),
+            (False, [(A, "unknown", None), (R, "ok", 200)], {"P", "A"}),   # floating add may land after
+            (False, [(A, "unknown", None), (A, "ok", 200)], {"P"}),        # same direction narrows
+            (True, [(R, "unknown", None), (A, "ok", 200)], {"P", "A"}),
+            (True, [(R, "unknown", None), (R, "ok", 200)], {"A"}),
+            (False, [(A, "ok", 200), (R, "ok", 200)], {"A"}),
+            (True, [(R, "ok", 200), (A, "rejected", 500)], {"P", "A"}),
+        ]
+        for seed_present, writes, want in cases:
+            self.assertEqual(self.poss(*writes, seed_present=seed_present), want, (seed_present, writes))
+
+    def test_remove_all(self):
+        m = world.SubscriberModel()
+        for u in ("u00001", "u00002"):
+            m.apply("c", u, world.ADD, world.APPLIED)
+        m.apply("c", "u00002", world.REMOVE, world.AMBIGUOUS)
+        m.remove_all("c", world.APPLIED)
+        self.assertEqual(world.possible(m.code("c", "u00001")), {"A"})
+        self.assertEqual(world.possible(m.code("c", "u00002")), {"A"})  # floating remove only adds A
+        m2 = world.SubscriberModel()
+        m2.apply("c", "u00001", world.ADD, world.APPLIED)
+        m2.remove_all("c", world.AMBIGUOUS)
+        self.assertEqual(world.possible(m2.code("c", "u00001")), {"P", "A"})
+
+    def test_storage_roundtrip_and_bound(self):
+        m = world.SubscriberModel()
+        m.apply("c", "u00001", world.ADD, world.APPLIED)
+        m.apply("c", "u00001", world.REMOVE, world.APPLIED)
+        m.apply("c", "u99999", world.ADD, world.AMBIGUOUS)
+        self.assertEqual([u for u, _ in m.items("c")], ["u00001", "u99999"])  # touched-but-absent still counted
+        m2 = world.SubscriberModel.from_json(json.loads(json.dumps(m.to_json())))
+        self.assertEqual(m2.items("c"), m.items("c"))
+        self.assertEqual(len(m.keys["c"]), world.UID_SPACE)
+        self.assertEqual(m.code("c", "zz_phantom"), 0)
+
+
+class TestB2OracleControls(Base):
+    """End-to-end through seedcheck: model transitions written by the harness API, state mutated in the mock."""
+
+    def mutate(self, writes, drop=(), add=()):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        wp = os.path.join(self.st, "world_seed.json")
+        w = _json(wp)
+        m = world.SubscriberModel.from_json(w["model"])
+        for uid, action, outcome, status in writes:
+            m.apply("repro_g001", uid, action, world.effect_of(outcome, status))
+        w["model"] = m.to_json()
+        with open(wp, "w") as f:
+            json.dump(w, f)
+        with self.cluster.state.mu:
+            s = self.cluster.state.subs[("repro_g001", 2)]
+            for u in drop:
+                s.discard(u)
+            for u in add:
+                s.add(u)
+        return self.o("seedcheck")
+
+    def test_reviewer_x2_rejected_add_then_loss_fails(self):
+        rc, rep = self.mutate([("u00001", world.ADD, "rejected", 400)], drop=["u00001"])
+        self.assertEqual((rc, rep["verdict"]), (1, "FAIL"))
+        self.assertEqual(rep["fail"], {"missing_subscriber": 1})
+
+    def test_unknown_add_then_loss_fails(self):
+        rc, rep = self.mutate([("u00001", world.ADD, "unknown", None)], drop=["u00001"])
+        self.assertEqual(rep["fail"], {"missing_subscriber": 1})
+
+    def test_not_sent_remove_then_loss_fails(self):
+        rc, rep = self.mutate([("u00001", world.REMOVE, "not_sent", None)], drop=["u00001"])
+        self.assertEqual(rep["fail"], {"missing_subscriber": 1})
+
+    def test_ambiguous_remove_then_absent_passes_with_scope(self):
+        rc, rep = self.mutate([("u00001", world.REMOVE, "unknown", None)], drop=["u00001"])
+        self.assertEqual(rep["verdict"], "PASS", rep)
+        cov = rep["subscriber_coverage"]["seed"]
+        self.assertEqual((cov["ambiguous_keys"], cov["ambiguous_absent"]), (1, 1))
+
+    def test_unknown_remove_cannot_create_member(self):
+        rc, rep = self.mutate([("u77777", world.REMOVE, "unknown", None)], add=["u77777"])
+        self.assertEqual(rep["fail"], {"unexpected_subscriber": 1})
+
+    def test_401_add_is_no_effect(self):
+        rc, rep = self.mutate([("u77777", world.ADD, "rejected", 401)], add=["u77777"])
+        self.assertEqual(rep["fail"], {"unexpected_subscriber": 1})
+
+    def test_ordering_floating_add_then_confirmed_remove(self):
+        rc, rep = self.mutate([("u77777", world.ADD, "unknown", None), ("u77777", world.REMOVE, "ok", 200)],
+                              add=["u77777"])
+        self.assertEqual(rep["verdict"], "PASS", rep)
+
+    def test_ordering_floating_add_then_confirmed_add(self):
+        rc, rep = self.mutate([("u77777", world.ADD, "unknown", None), ("u77777", world.ADD, "ok", 200)])
+        self.assertEqual(rep["fail"], {"missing_subscriber": 1})
+
+    def test_scope_threshold(self):
+        writes = [("u%05d" % i, world.REMOVE, "unknown", None) for i in range(10)]
+        rc, rep = self.mutate(writes)
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+        self.assertEqual(rep["scope_errors"], {"ambiguous_ratio_above_threshold": 1})
 
 
 class TestConnectionRefusedIsNotSent(unittest.TestCase):
