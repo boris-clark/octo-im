@@ -24,9 +24,9 @@ from collections import defaultdict, deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from wkload import HARNESS_VERSION  # noqa: E402
-from wkload.common import (OK, REJECTED, UNKNOWN, NOT_SENT, Client, Journal, Redactor,  # noqa: E402
+from wkload.common import (OK, REJECTED, UNKNOWN, NOT_SENT, Client, Journal, JournalError, Redactor,  # noqa: E402
                            read_token_file, split_endpoints, tool_hashes, write_json, read_json)
-from wkload.world import (ADD, REMOVE, SubscriberModel, addremove_stream, build_channels,  # noqa: E402
+from wkload.world import (ADD, SubscriberModel, addremove_stream, build_channels,  # noqa: E402
                           effect_of, seed_members, send_stream, upsert_stream)
 
 PAYLOAD = base64.b64encode(b"repro-load-message").decode()
@@ -97,6 +97,7 @@ class Ctx:
         self.client = Client(self.token, a.budget + 1.0)
         self.channels = build_channels(a.groups, a.children, a.channel_prefix)
         self.stop = threading.Event()
+        self.journals = []
         os.makedirs(a.state_dir, exist_ok=True)
 
     def endpoint(self, global_wid):
@@ -108,7 +109,8 @@ def header(ctx, phase):
     return {
         "harness_version": HARNESS_VERSION, "phase": phase, "tool_sha256": tool_hashes(),
         "python": platform.python_version(), "host": platform.node(), "started_at": time.time(),
-        "config": {"api": ctx.apis, "seconds": a.seconds, "groups": a.groups, "children": a.children,
+        "load_payload": PAYLOAD,
+        "config": {"run_id": a.run_id, "api": ctx.apis, "seconds": a.seconds, "groups": a.groups, "children": a.children,
                    "parent_members": a.parent_members, "child_members": a.child_members,
                    "addremove": a.addremove, "send": a.send, "upsert": a.upsert, "budget": a.budget,
                    "client_timeout": a.budget + 1.0, "seed": a.seed, "channel_prefix": a.channel_prefix,
@@ -124,6 +126,7 @@ def do_seed(ctx):
     a = ctx.a
     model = SubscriberModel()
     journal = Journal(os.path.join(a.state_dir, "seed_journal.jsonl.gz"), ctx.redact)
+    ctx.journals.append(journal)
     M = Metrics()
     base = ctx.apis[0]
     t0 = time.time()
@@ -208,17 +211,27 @@ def upsert_worker(ctx, M, journal, wid, gwid):
 def do_load(ctx, model):
     a = ctx.a
     M = Metrics()
-    journal = Journal(os.path.join(a.state_dir, "load_journal.jsonl.gz"), ctx.redact)
+    journal = Journal(os.path.join(a.state_dir, "load_journal.jsonl.gz"), ctx.redact, evidence=True)
+    ctx.journals.append(journal)
     threads = []
+    worker_errors = []
+
+    def worker(fn, *args):
+        try:
+            fn(*args)
+        except Exception as exc:
+            worker_errors.append(type(exc).__name__)
+            ctx.stop.set()
+
     g = 0
     for i in range(a.addremove):
-        threads.append(threading.Thread(target=addremove_worker, args=(ctx, model, M, journal, i, g), daemon=True))
+        threads.append(threading.Thread(target=worker, args=(addremove_worker, ctx, model, M, journal, i, g), daemon=True))
         g += 1
     for i in range(a.send):
-        threads.append(threading.Thread(target=send_worker, args=(ctx, M, journal, i, g), daemon=True))
+        threads.append(threading.Thread(target=worker, args=(send_worker, ctx, M, journal, i, g), daemon=True))
         g += 1
     for i in range(a.upsert):
-        threads.append(threading.Thread(target=upsert_worker, args=(ctx, M, journal, i, g), daemon=True))
+        threads.append(threading.Thread(target=worker, args=(upsert_worker, ctx, M, journal, i, g), daemon=True))
         g += 1
     hdr = header(ctx, "load")
     print("START workload: %d add/remove + %d send + %d upsert = %d workers, %ds over %d endpoint(s)" % (
@@ -229,7 +242,7 @@ def do_load(ctx, model):
     for t in threads:
         t.start()
     last = 0
-    while time.monotonic() - start < a.seconds:
+    while time.monotonic() - start < a.seconds and not ctx.stop.is_set():
         time.sleep(min(a.report_interval, max(0.05, a.seconds - (time.monotonic() - start))))
         snap, ft, fs, ff, samples = M.snapshot()
         el = time.monotonic() - start
@@ -250,18 +263,24 @@ def do_load(ctx, model):
         t.join(max(0.0, deadline - time.monotonic()))
         if t.is_alive():
             stuck.append(t.name)
-    journal.close()
+    journal_error = None
+    try:
+        journal.close()
+    except JournalError as exc:
+        journal_error = ctx.redact(str(exc))
     snap, ft, fs, ff, samples = M.snapshot()
     final = {"final": True, "elapsed": round(time.monotonic() - start, 1), "kinds": snap, "first_timeout": ft,
              "first_slow": fs, "first_fail": ff, "fail_samples": samples, "stuck_workers": stuck,
-             "journal_records": journal.count}
+             "journal_records": journal.count, "journal_complete": not journal_error and not stuck and not worker_errors,
+             "journal_error": journal_error, "worker_errors": worker_errors,
+             "producer_evidence": journal.summary.snapshot()}
     rep.write(ctx.redact(json.dumps(final)) + "\n")
     rep.close()
     state = {"header": hdr, "finished_at": time.time(), "final": final, "model": model.to_json()}
     write_json(os.path.join(a.state_dir, "world_final.json"), state, ctx.redact)
     print("FINAL: %s" % ctx.redact(json.dumps({k: {"n": v["n"], "outcome": v["outcome"]} for k, v in snap.items()})),
           flush=True)
-    return not stuck
+    return final["journal_complete"]
 
 
 def parse_args(argv=None):
@@ -299,6 +318,9 @@ def main(argv=None):
         return run(ctx)
     finally:
         ctx.client.close_all()
+        for journal in ctx.journals:
+            if not journal.closed:
+                journal.close()
 
 
 def run(ctx):

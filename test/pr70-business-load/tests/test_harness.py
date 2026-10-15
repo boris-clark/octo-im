@@ -486,7 +486,7 @@ class TestRedDuplicateMessage(Base):
 
     def test(self):
         rc, rep = self.full_green()
-        self.assertEqual(rep["fail"], {"duplicate_message": 1})
+        self.assertEqual(rep["fail"], {"duplicate_message": 1, "duplicate_message_id": 1})
 
 
 class TestRedSeqGap(Base):

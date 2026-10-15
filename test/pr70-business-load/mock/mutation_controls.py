@@ -49,9 +49,9 @@ MUTATIONS = [
      'self.bad("missing_accepted_message"', '(lambda *a: None)("missing_accepted_message"',
      ["test_harness.TestRedMissingMessage", "test_harness.TestRedRestartLoss"]),
     ("M9_N3_preflight_readback_removed", "oracle.py",
-     "            for page in o.pages(cid, ctype):\n                if page is None:\n                    break\n"
-     "                n += len(page)\n",
-     "            pass\n",
+     "                for page in o.pages(cid, ctype):\n                    if page is None:\n                        break\n"
+     "                    n += len(page)\n",
+     "                pass\n",
      ["test_harness.TestN3StaleMessagesWithUnloadedConfig"]),
     ("M10_N4_per_socket_timeout", "wkload/common.py",
      "chunk = r.read1(65536)", "chunk = r.read(65536)",
@@ -65,6 +65,30 @@ MUTATIONS = [
     ("M13_P1_unknown_writes_excluded_from_denominator", "oracle.py",
      'if k != OK)', 'if k not in (OK, UNKNOWN))',
      ["test_harness.TestB3P1Correction.test_load_write_denominator_and_ratio"]),
+    ("M14_B4_journal_hash_not_reconciled", "wkload/evidence.py",
+     "s != f['producer_evidence']", "False",
+     ["test_evidence.TestEvidence.test_receipt_hash_mismatch"]),
+    ("M15_B4_counters_not_reconciled", "wkload/evidence.py",
+     "if counts != s['counts'] or any(v['n'] != sum(v['outcome'].values()) for v in f['kinds'].values()):",
+     "if False:", ["test_evidence.TestEvidence.test_counter_mismatch"]),
+    ("M16_B4_finalization_ignored", "wkload/evidence.py",
+     "f.get('journal_complete') is not True", "False",
+     ["test_evidence.TestEvidence.test_incomplete_writer_finalization"]),
+    ("M17_B5_receipt_equality_removed", "oracle.py",
+     "if outcome == OK and mid != expected_mid:", "if False:",
+     ["test_evidence.TestEvidence.test_changed_message_id", "test_evidence.TestEvidence.test_restart_changed_id"]),
+    ("M18_B5_duplicate_id_ignored", "oracle.py",
+     "elif seen.duplicate_mid(mid):", "elif False:",
+     ["test_evidence.TestEvidence.test_duplicate_message_ids"]),
+    ("M19_B5_invalid_id_ignored", "oracle.py",
+     "if not valid_mid(mid):", "if False:",
+     ["test_evidence.TestEvidence.test_invalid_message_id"]),
+    ("M20_B4_writer_failure_suppressed", "harness.py",
+     '"journal_complete": not journal_error and not stuck and not worker_errors,',
+     '"journal_complete": True,',
+     ["test_evidence.TestJournalFailures.test_failed_writer_invalidates_final_and_exit",
+      "test_evidence.TestJournalFailures.test_close_failure_invalidates_final_and_exit"]),
+
 ]
 
 

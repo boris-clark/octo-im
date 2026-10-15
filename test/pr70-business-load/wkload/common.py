@@ -18,7 +18,8 @@ import hashlib
 import http.client
 import json
 import os
-import queue
+import subprocess
+import sys
 import socket
 import stat
 import threading
@@ -210,40 +211,118 @@ class Client:
         return Result(r.status, body, dt, OK, None, t_wall)
 
 
-class Journal:
-    """Single-writer gzip JSONL journal. Every request outcome is appended, nothing sampled."""
+class JournalError(OSError):
+    pass
 
-    def __init__(self, path, redact):
-        self.path = path
-        self.redact = redact
-        self.q = queue.Queue(maxsize=200000)
-        self.f = gzip.open(path, "wt", compresslevel=1, encoding="utf-8")
-        self.count = 0
-        self.t = threading.Thread(target=self._run, name="journal", daemon=True)
-        self.t.start()
+
+def _journal_writer(path, sock, result):
+    """Isolated I/O can be terminated and collected if the filesystem stalls."""
+    count = 0
+    try:
+        with sock, sock.makefile("rb") as stream, gzip.open(path, "wt", compresslevel=1, encoding="utf-8") as f:
+            while True:
+                line = stream.readline(1048577)
+                if not line:
+                    break
+                if len(line) > 1048576 or not line.endswith(b"\n"):
+                    raise ValueError("incomplete or oversized journal record")
+                f.write(line.decode("utf-8"))
+                count += 1
+        result.sendall(json.dumps([True, count, None]).encode())
+    except BaseException as exc:
+        result.sendall(json.dumps([False, count, type(exc).__name__]).encode())
+    finally:
+        result.close()
+
+
+class Journal:
+    """Bounded single-writer gzip process with direct socket backpressure.
+
+    A bounded OS socket buffer replaces an in-process queue. Send: 5 seconds;
+    close: 10 seconds then terminate and collect the child. No feeder thread.
+    """
+    def __init__(self, path, redact, evidence=False):
+        self.path, self.redact = path, redact
+        self.mu = threading.Lock()
+        self.summary = None
+        if evidence:
+            from .evidence import Summary
+            self.summary = Summary()
+        self.count, self.closed, self.error = 0, False, None
+        self.sock, child_sock = socket.socketpair()
+        self.sock.settimeout(5.0)
+        self.result, child = socket.socketpair()
+        self.t = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), path,
+                                   str(child_sock.fileno()), str(child.fileno())],
+                                  pass_fds=(child_sock.fileno(), child.fileno()))
+        child_sock.close()
+        child.close()
 
     def write(self, rec):
-        self.q.put(rec)
-
-    def _run(self):
-        while True:
-            rec = self.q.get()
-            if rec is None:
-                break
-            self.f.write(self.redact(json.dumps(rec, separators=(",", ":"))) + "\n")
-            self.count += 1
+        line = (self.redact(json.dumps(rec, separators=(",", ":"))) + "\n").encode()
+        with self.mu:
+            if self.closed or self.error or self.t.poll() is not None:
+                raise JournalError("journal writer closed or failed")
+            try:
+                self.sock.sendall(line)
+            except OSError as exc:
+                self.error = "journal send failed: " + type(exc).__name__
+                raise JournalError(self.error) from exc
+            if self.summary is not None:
+                self.summary.record(rec)
 
     def close(self):
-        self.q.put(None)
-        self.t.join()
-        self.f.close()
+        if self.closed:
+            if self.error:
+                raise JournalError(self.error)
+            return
+        self.closed = True
+        try:
+            self.sock.shutdown(socket.SHUT_WR)
+            try:
+                self.t.wait(timeout=10.0)
+            except subprocess.TimeoutExpired as exc:
+                raise JournalError("journal close deadline exceeded") from exc
+            raw = self.result.recv(4096)
+            if not raw:
+                raise JournalError("journal final receipt missing")
+            ok, self.count, err = json.loads(raw)
+            if not ok or self.t.returncode != 0 or self.error:
+                raise JournalError(self.error or "journal write/finalization failed: %s" % err)
+        except (OSError, EOFError) as exc:
+            self.error = str(exc)
+            raise JournalError(self.error) from exc
+        finally:
+            self.sock.close()
+            if self.t.poll() is None:
+                self.t.terminate()
+                try:
+                    self.t.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    self.t.kill()
+                    self.t.wait(timeout=2.0)
+            self.result.close()
 
 
 def read_journal(path):
+    """Stream bounded input: 1 MiB/record, 64 GiB decoded, 30 minute scan limit.
+
+    Reads require a completed gzip trailer; truncated and invalid JSON fail closed.
+    Local regular files are required; named pipes/devices are rejected.
+    """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise ValueError("journal must be a regular file")
+    total = 0
+    deadline = time.monotonic() + 1800
     with gzip.open(path, "rt", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
+        while True:
+            line = f.readline(1048577)
+            if not line:
+                break
+            total += len(line)
+            if len(line) > 1048576 or total > 64 * 1024 ** 3 or time.monotonic() > deadline:
+                raise ValueError("journal evidence size/time bound exceeded")
+            if line.strip():
                 yield json.loads(line)
 
 
@@ -260,7 +339,7 @@ def tool_hashes():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = {}
     for rel in ("harness.py", "oracle.py", "poller.py", "monitor_run.py", "analyze.py",
-                "wkload/__init__.py", "wkload/common.py", "wkload/world.py"):
+                "wkload/__init__.py", "wkload/common.py", "wkload/world.py", "wkload/evidence.py"):
         p = os.path.join(root, rel)
         if os.path.exists(p):
             out[rel] = file_sha256(p)
@@ -278,5 +357,13 @@ def write_json(path, obj, redact=None):
 
 
 def read_json(path):
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 256 * 1024 ** 2:
+        raise ValueError("JSON evidence must be a regular file <=256 MiB")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+if __name__ == "__main__":
+    _journal_writer(sys.argv[1], socket.socket(fileno=int(sys.argv[2])),
+                    socket.socket(fileno=int(sys.argv[3])))

@@ -47,7 +47,7 @@ reported as the verdict scope; above --max-ambiguous-ratio (default zero) the
 result is INCONCLUSIVE, never PASS.
 
 Memory is bounded for multi-million message runs: the send ledger is kept as
-per-worker byte/short arrays and the restart snapshot as a per-channel
+an on-disk SQLite ledger with an 8 MiB page cache and the restart snapshot as a per-channel
 (count, sha256) pair.
 
 Verdict: FAIL if any check failed, INCONCLUSIVE if only read errors or scope
@@ -61,11 +61,12 @@ import json
 import os
 import sys
 import time
-from array import array
+import sqlite3
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from wkload.evidence import DiskLedger, DiskSeen, valid_mid
 from wkload import HARNESS_VERSION  # noqa: E402
 from wkload.common import (OK, REJECTED, UNKNOWN, NOT_SENT, Client, Redactor, read_journal,  # noqa: E402
                            read_token_file, split_endpoints, tool_hashes, write_json, read_json)
@@ -112,97 +113,8 @@ def load_write_accounting(state_dir):
                           "and teardown requests are excluded. Missing journal is reported explicitly."}
 
 
-class Ledger:
-    """Every message the harness or oracle sent, with its write outcome.
-
-    Load sends use client_msg_no <run>-sWW-NNNNNNNN and are stored as per-worker
-    arrays indexed by NNNNNNNN-1 (outcome code, channel index, from-uid number).
-    Probe sends are few and kept in a dict.
-    """
-
-    def __init__(self, state_dir, run_id, channels):
-        self.run_id = run_id
-        self.channels = channels
-        self.chidx = {c[0]: i for i, c in enumerate(channels)}
-        self.out, self.ch, self.frm = {}, {}, {}
-        self.probes = {}
-        p = os.path.join(state_dir, "load_journal.jsonl.gz")
-        if os.path.exists(p):
-            for rec in read_journal(p):
-                if rec.get("kind") != "message_send":
-                    continue
-                k = self.load_key(rec["cmn"])
-                if k is None:
-                    raise SystemExit("journal client_msg_no %r does not match --run-id %r" % (rec["cmn"], run_id))
-                w, n = k
-                o, c, f = self.out.setdefault(w, bytearray()), self.ch.setdefault(w, array("H")), \
-                    self.frm.setdefault(w, array("H"))
-                while len(o) < n:
-                    o.append(0)
-                    c.append(0)
-                    f.append(0)
-                o[n - 1] = CODE[rec["outcome"]]
-                c[n - 1] = self.chidx[rec["ch"]]
-                f[n - 1] = int(rec["from"][1:])
-        for name in sorted(os.listdir(state_dir)):
-            if name.startswith("probes_") and name.endswith(".json"):
-                self.probes.update(read_json(os.path.join(state_dir, name)))
-
-    def load_key(self, cmn):
-        parts = cmn.split("-") if isinstance(cmn, str) else []
-        if len(parts) == 3 and parts[0] == self.run_id and parts[1][:1] == "s" and parts[1][1:].isdigit() \
-                and parts[2].isdigit():
-            return int(parts[1][1:]), int(parts[2])
-        return None
-
-    def lookup(self, cmn):
-        """-> (key, outcome, channel_id, from_uid, payload, probe_label) or None."""
-        k = self.load_key(cmn)
-        if k is not None:
-            w, n = k
-            o = self.out.get(w)
-            if o is None or n < 1 or n > len(o) or o[n - 1] == 0:
-                return None
-            return (k, OUTCOME[o[n - 1]], self.channels[self.ch[w][n - 1]][0], "u%05d" % self.frm[w][n - 1],
-                    LOAD_PAYLOAD, None)
-        v = self.probes.get(cmn)
-        if v is None:
-            return None
-        return (cmn, v["outcome"], v["ch"], v["from"], v["payload"], v.get("probe"))
-
-    def entries(self):
-        """Yields (key, outcome, channel_id, cmn)."""
-        for w, o in self.out.items():
-            ch = self.ch[w]
-            for i, code in enumerate(o):
-                if code:
-                    yield (w, i + 1), OUTCOME[code], self.channels[ch[i]][0], "%s-s%02d-%08d" % (self.run_id, w, i + 1)
-        for cmn, v in self.probes.items():
-            yield cmn, v["outcome"], v["ch"], cmn
-
-
-class Seen:
-    """Compact seen-counter keyed like Ledger (capped at 255)."""
-
-    def __init__(self, ledger):
-        self.w = {w: bytearray(len(o)) for w, o in ledger.out.items()}
-        self.p = defaultdict(int)
-
-    def bump(self, key):
-        if isinstance(key, tuple):
-            arr = self.w[key[0]]
-            c = arr[key[1] - 1]
-            if c < 255:
-                arr[key[1] - 1] = c + 1
-            return c
-        c = self.p[key]
-        self.p[key] = c + 1
-        return c
-
-    def get(self, key):
-        if isinstance(key, tuple):
-            return self.w[key[0]][key[1] - 1]
-        return self.p.get(key, 0)
+# Disk-backed identities and seen counters keep full-hour memory bounded.
+Ledger, Seen = DiskLedger, DiskSeen
 
 
 class Oracle:
@@ -223,7 +135,12 @@ class Oracle:
         self.read_errors = defaultdict(int)
         self.scope_errors = defaultdict(int)
         self.coverage = {}
-        self.load_writes = load_write_accounting(a.state_dir)
+        self._ledger = None
+        try:
+            self.load_writes = load_write_accounting(a.state_dir)
+        except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+            self.load_writes = {"journal_present": True, "outcomes": {}, "total": 0, "non_ok": 0,
+                                "non_ok_ratio": None, "unreadable": True}
         self.examples = defaultdict(list)
 
     # ---------- bookkeeping ----------
@@ -245,7 +162,11 @@ class Oracle:
         return "PASS"
 
     def ledger(self):
-        return Ledger(self.a.state_dir, self.a.run_id, self.channels)
+        if self._ledger is None:
+            self._ledger = Ledger(self.a.state_dir, self.a.run_id, self.channels)
+        else:
+            self._ledger.refresh_probes(self.a.state_dir)
+        return self._ledger
 
     # ---------- reads ----------
     def health(self):
@@ -499,6 +420,10 @@ class Oracle:
             for m in page:
                 seq, cmn, mid = m.get("message_seq"), m.get("client_msg_no"), m.get("message_id")
                 count += 1
+                if not valid_mid(mid):
+                    self.bad("invalid_message_id", {"ch": cid, "cmn": cmn, "mid": mid})
+                elif seen.duplicate_mid(mid):
+                    self.bad("duplicate_message_id", {"ch": cid, "cmn": cmn, "mid": mid})
                 if prev is None:
                     if seq != 1:
                         self.bad("seq_gap", {"ch": cid, "first": seq})
@@ -521,7 +446,9 @@ class Oracle:
                 if ent is None:
                     self.bad("unexpected_message", {"ch": cid, "cmn": cmn, "seq": seq})
                     continue
-                key, outcome, ech, efrom, epayload, _pl = ent
+                key, outcome, ech, efrom, epayload, _pl, expected_mid = ent
+                if outcome == OK and mid != expected_mid:
+                    self.bad("message_id_mismatch", {"ch": cid, "cmn": cmn, "expected": expected_mid, "got": mid})
                 if seen.bump(key):
                     self.bad("duplicate_message", {"ch": cid, "cmn": cmn, "seq": seq})
                     continue
@@ -535,8 +462,8 @@ class Oracle:
                     self.bad("not_sent_but_persisted", {"ch": cid, "cmn": cmn})
                 elif outcome == UNKNOWN:
                     self.info["unknown_send_persisted"] += 1
-                if isinstance(key, tuple):
-                    w, n = key
+                if ledger.load_key(key) is not None:
+                    w, n = ledger.load_key(key)
                     if last_n_by_worker.get(w, 0) > n:
                         self.info["same_worker_order_inversion"] += 1
                     last_n_by_worker[w] = n
@@ -617,7 +544,8 @@ class Oracle:
             body = {"header": {"no_persist": 0, "red_dot": 1, "sync_once": 0}, "client_msg_no": cmn,
                     "from_uid": "u00000", "channel_id": cid, "channel_type": ctype, "payload": PROBE_PAYLOAD}
             r = self.client.call("POST", self.apis[0], "/message/send", body)
-            led[cmn] = {"ch": cid, "outcome": r.outcome, "from": "u00000", "payload": PROBE_PAYLOAD, "probe": label}
+            led[cmn] = {"ch": cid, "outcome": r.outcome, "from": "u00000", "payload": PROBE_PAYLOAD, "probe": label,
+                        "mid": ((r.json() or {}).get("data") or {}).get("message_id") if r.outcome == OK else None}
             if r.outcome != OK:
                 self.bad("probe_send_not_ok", {"ch": cid, "http": r.status, "err": r.err})
         write_json(os.path.join(self.a.state_dir, "probes_%s.json" % label), led, self.redact)
@@ -645,6 +573,8 @@ def run(a):
         return check(o, a)
     finally:
         o.client.close_all()
+        if o._ledger is not None:
+            o._ledger.close()
 
 
 def check(o, a):
@@ -655,58 +585,66 @@ def check(o, a):
     label = a.mode if a.mode != "restart" else "restart%d" % a.restart_index
     rep["leaders"] = o.leaders(label)
 
-    if a.mode == "preflight":
-        # max_message_seq answers 0 while a channel config is not loaded (LeaderOfChannelForRead),
-        # so stale messages are looked for with a real messagesync readback as well. Disclosed
-        # side effect: messagesync creates the channel cluster config (GetOrCreate...FromSlotLeader).
-        for cid, ctype, _g in o.channels:
-            s = o.subscribers(cid, ctype)
-            if s:
-                o.bad("stale_state_subscribers", {"ch": cid, "n": len(s)})
-            n = 0
-            for page in o.pages(cid, ctype):
-                if page is None:
-                    break
-                n += len(page)
-            if n:
-                o.bad("stale_state_messages", {"ch": cid, "messages": n})
-            ms = o.max_seq(cid, ctype)
-            if ms:
-                o.bad("stale_state_messages", {"ch": cid, "max_message_seq": ms})
+    try:
+        if a.mode in ("post", "restart", "teardown"):
+            o.ledger()  # Validate before any probe, teardown or snapshot.
+            o.load_writes["verified_complete"] = True
+        if a.mode == "preflight":
+            # max_message_seq answers 0 while a channel config is not loaded (LeaderOfChannelForRead),
+            # so stale messages are looked for with a real messagesync readback as well. Disclosed
+            # side effect: messagesync creates the channel cluster config (GetOrCreate...FromSlotLeader).
+            for cid, ctype, _g in o.channels:
+                s = o.subscribers(cid, ctype)
+                if s:
+                    o.bad("stale_state_subscribers", {"ch": cid, "n": len(s)})
+                n = 0
+                for page in o.pages(cid, ctype):
+                    if page is None:
+                        break
+                    n += len(page)
+                if n:
+                    o.bad("stale_state_messages", {"ch": cid, "messages": n})
+                ms = o.max_seq(cid, ctype)
+                if ms:
+                    o.bad("stale_state_messages", {"ch": cid, "max_message_seq": ms})
 
-    elif a.mode == "seedcheck":
-        o.check_subscribers(model_from(a.state_dir, "world_seed.json"), "seed")
+        elif a.mode == "seedcheck":
+            o.check_subscribers(model_from(a.state_dir, "world_seed.json"), "seed")
 
-    elif a.mode == "post":
-        rep["drain"] = o.drain(o.ledger())
-        o.check_subscribers(model_from(a.state_dir, "world_final.json"), "post")
-        rep["probe"] = o.probe("post")
-        write_json(o.snapshot_path(), o.account("post"), o.redact)
+        elif a.mode == "post":
+            rep["drain"] = o.drain(o.ledger())
+            o.check_subscribers(model_from(a.state_dir, "world_final.json"), "post")
+            rep["probe"] = o.probe("post")
+            write_json(o.snapshot_path(), o.account("post"), o.redact)
 
-    elif a.mode == "restart":
-        label = "restart%d" % a.restart_index
-        snap = read_json(o.snapshot_path())
-        o.check_subscribers(model_from(a.state_dir, "world_final.json"), label)
-        rep["probe"] = o.probe(label)
-        # the next restart (T3 leader after follower) compares against this state
-        write_json(o.snapshot_path(), o.account(label, snap=snap, probe_label=label), o.redact)
+        elif a.mode == "restart":
+            label = "restart%d" % a.restart_index
+            snap = read_json(o.snapshot_path())
+            o.check_subscribers(model_from(a.state_dir, "world_final.json"), label)
+            rep["probe"] = o.probe(label)
+            # the next restart (T3 leader after follower) compares against this state
+            write_json(o.snapshot_path(), o.account(label, snap=snap, probe_label=label), o.redact)
 
-    elif a.mode == "teardown":
-        model = model_from(a.state_dir, "world_final.json")
-        out = defaultdict(int)
-        for cid, ctype, _g in o.channels:
-            r = o.client.call("POST", o.apis[0], "/channel/subscriber_remove_all",
-                              {"channel_id": cid, "channel_type": ctype}, timeout=a.write_timeout)
-            out[r.outcome] += 1
-            model.remove_all(cid, effect_of(r.outcome, r.status))
-            if r.outcome != OK:
-                o.bad("teardown_not_ok", {"ch": cid, "http": r.status, "err": r.err})
-        rep["teardown_outcomes"] = dict(out)
-        write_json(os.path.join(a.state_dir, "world_teardown.json"), {"model": model.to_json()}, o.redact)
-        # 378 -> 0 means subscriber sets: channels and channel cluster configs persist (no delete route used)
-        o.check_subscribers(model, "teardown")
-        rep["probe"] = o.probe("teardown")
-        o.account("teardown")
+        elif a.mode == "teardown":
+            model = model_from(a.state_dir, "world_final.json")
+            out = defaultdict(int)
+            for cid, ctype, _g in o.channels:
+                r = o.client.call("POST", o.apis[0], "/channel/subscriber_remove_all",
+                                  {"channel_id": cid, "channel_type": ctype}, timeout=a.write_timeout)
+                out[r.outcome] += 1
+                model.remove_all(cid, effect_of(r.outcome, r.status))
+                if r.outcome != OK:
+                    o.bad("teardown_not_ok", {"ch": cid, "http": r.status, "err": r.err})
+            rep["teardown_outcomes"] = dict(out)
+            write_json(os.path.join(a.state_dir, "world_teardown.json"), {"model": model.to_json()}, o.redact)
+            # 378 -> 0 means subscriber sets: channels and channel cluster configs persist (no delete route used)
+            o.check_subscribers(model, "teardown")
+            rep["probe"] = o.probe("teardown")
+            o.account("teardown")
+
+    except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError, OverflowError, sqlite3.Error) as exc:
+        o.load_writes["verified_complete"] = False
+        o.rerr("load_evidence", {"error": type(exc).__name__, "detail": o.redact(str(exc))[:300]})
 
     rep["verdict"] = o.verdict()
     rep["fail"] = dict(o.fail)

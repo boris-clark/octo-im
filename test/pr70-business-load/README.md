@@ -138,7 +138,7 @@ The original files are byte-identical to XIN-1968. They take the token only on a
 target an instance with no manager token configured.
 
 Exit codes: oracle `0` PASS, `1` FAIL, `3` INCONCLUSIVE (read or scope errors). Harness: `0` ok,
-`2` seed failure, `4` a worker did not stop within the bound. A non-ok request outcome is a
+`2` seed failure, `4` a worker or journal writer failed, did not stop, or did not finalize successfully. A non-ok request outcome is a
 recorded result, not a harness error.
 
 ## Budget (unchanged from the XIN-2199 estimate)
@@ -157,9 +157,41 @@ deployments about 1 h. Total about 9.5-10 h sequential, as approved. The correct
 identity, leader and forwarding reads (about 378 x nodes small GETs per mode) and a preflight
 readback. Neither changes the estimate materially.
 
-Memory: the subscriber model is about 38 MB at most (one byte per channel and uid). The send ledger
-takes about 7 bytes per send, readback is streamed, and server logs are streamed.
+Memory: the subscriber model is about 38 MB at most (one byte per channel and uid). Message
+receipts, seen counts and stored-ID uniqueness use a disposable SQLite file with an 8 MiB page
+cache, disk temp storage and a 16 GiB database cap. Reserve at least 16 GiB of scratch space per
+active oracle in addition to journals/logs; exhaustion is INCONCLUSIVE. Data is streamed; no
+allocation depends on an untrusted message sequence. Full-hour disk use and timing still require
+campaign measurement; mock rates are not product capacity evidence.
 
 Envelope rule: compare head against base only within the same topology and envelope (single
 2 CPU / 4 GiB; three-node 1 CPU / 2 GiB per node). Do not compare three-node numbers with
 single-node numbers or with the historical 2 CPU / 4 GiB results.
+
+### Completed-load evidence and message identity (B4/B5)
+
+Use a fresh state directory and unique run ID per arm. New runs record the run ID and payload in
+the load header. Producers independently record per-kind/outcome totals and one SHA-256 chain per
+worker over every request record, including client number, channel, sender and receipt message ID.
+After all workers and the gzip writer finish, `world_final.json` records those chains, the writer's
+record count, worker errors and `journal_complete`. The oracle reconciles every journal record
+against this completed record and final counters before post/restart/teardown. Missing, empty,
+truncated, malformed, partial or mismatched evidence is INCONCLUSIVE; no accepted-message ledger,
+new snapshot, probes or teardown is derived from it. A seed-only seedcheck remains valid before
+load. Older run directories without these receipts must not be accepted as complete new runs.
+
+The gzip writer runs in a separate collected process with bounded socket backpressure: 5-second
+send and 10-second close bounds, followed by process cleanup on failure. Failure reaches the
+load exit status and final record. These are evidence-I/O limits, not changes to request timeouts,
+workload, server restart procedures or the campaign budget. JSON evidence is limited to regular
+files of at most 256 MiB. Journal reads enforce 1 MiB per record, 64 GiB decoded and a 30-minute
+streaming scan bound; local filesystem stalls remain subject to OS behavior. Errors never PASS.
+
+The product creates an int64 message ID for each unique unretried send and carries that ID to
+storage (`internal/api/message.go`, `internal/channel/handler/event_persist.go`). The oracle keeps
+receipt IDs for both load sends and probes. Every stored ID must be a positive int64, unique across
+the full dataset, and equal to its acknowledged receipt ID. This independent check runs before
+snapshot comparison and again after each restart. IDs need not be globally contiguous; sequence
+checks remain channel-local. Unknown sends have no receipt-ID equality assertion, but their
+stored IDs must still be valid and unique. Duplicate client numbers or receipt IDs invalidate
+the evidence rather than silently replacing an earlier record.

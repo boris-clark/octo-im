@@ -131,3 +131,17 @@ FAIL. That is the business expectation, and it is stricter than the HTTP contrac
   non-ok outcomes per minute. It reports metric deltas per node, counts
   `propose batch until applied timeout` / `context deadline exceeded` / panic /
   fatal in operator-supplied logs, and lists oracle verdicts.
+
+## Completed evidence and stored identity correction
+
+B4 adds independent producer hash chains and counters, finalized writer counts and explicit
+worker/writer completion. Post/restart/teardown reconcile them with the durable gzip journal before
+performing their write/readback stages. Absent or incomplete evidence is INCONCLUSIVE, not an
+empty accepted ledger. Seed-only seedcheck remains supported. Every failed attempt is retained.
+
+B5 replaces sequence-indexed message arrays with disk-backed identities, seen counters and ID
+uniqueness. Accepted sends and probes retain the actual receipt int64 ID and compare it against
+independent stored readback, including after restart. Invalid/duplicate stored IDs and receipt
+mismatch FAIL even if a fresh snapshot would otherwise bless them. This relies only on the
+unique, unretried client-number workload and the verified product ID-to-storage contract; it
+introduces no global contiguous-ID assumption. Resource and evidence limits are in README.
