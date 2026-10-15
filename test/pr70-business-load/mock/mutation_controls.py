@@ -56,6 +56,15 @@ MUTATIONS = [
     ("M10_N4_per_socket_timeout", "wkload/common.py",
      "chunk = r.read1(65536)", "chunk = r.read(65536)",
      ["test_harness.TestN4WholeRequestDeadline"]),
+    ("M11_B3_strict_teardown_removed", "oracle.py",
+     'if label == "teardown" and act:', 'if False:',
+     ["test_harness.TestB3P1Correction.test_reviewer_z2_teardown_surviving_ambiguous_uid_fails"]),
+    ("M12_P1_nonzero_default_restored", "oracle.py",
+     'type=float, default=0.0,', 'type=float, default=0.01,',
+     ["test_harness.TestB3P1Correction.test_one_ambiguous_key_is_inconclusive_by_default"]),
+    ("M13_P1_unknown_writes_excluded_from_denominator", "oracle.py",
+     'if k != OK)', 'if k not in (OK, UNKNOWN))',
+     ["test_harness.TestB3P1Correction.test_load_write_denominator_and_ratio"]),
 ]
 
 

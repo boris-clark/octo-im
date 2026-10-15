@@ -79,8 +79,22 @@ The oracle requires every uid whose only possible state is present to be
 present. It requires every other uid to be absent: possible state "absent" only,
 or never touched. Uids with both states possible are unconstrained and counted.
 The share of ambiguous keys among touched keys is reported in every subscriber
-check as the verdict scope. Above `--max-ambiguous-ratio` (default 1%,
+check as the verdict scope. Above `--max-ambiguous-ratio` (default zero,
 pre-declared, recorded in the report) the result is INCONCLUSIVE, never PASS.
+No nonzero allowance is approved; the earlier 1% proposal remains pending an Owner decision.
+Every check also reports absolute ambiguous keys in successfully read channels, non-OK load request count, and their ratio
+(`ambiguous_keys_per_non_ok_load_write`). The denominator counts rejected, unknown and not-sent
+subscriber add/remove, message-send and channel-info requests in the load journal, excluding seed,
+oracle probes and teardown. Full outcome counts, total, non-OK request share (`non_ok_ratio`) and journal availability are recorded as
+`load_write_accounting`. This is a descriptive keys/requests ratio, not causal attribution or a
+probability; it may exceed one (for example with seed ambiguity). A zero denominator yields JSON
+null. Counting streams the journal and does not retain requests in memory.
+
+Teardown additionally requires strict empty served subscriber sets after successful remove_all,
+regardless of load-era floating adds. A survivor fails `not_empty_after_teardown`; any non-OK
+remove_all fails `teardown_not_ok`. Load workers have stopped before teardown. This strict
+assertion does not change the B2 model or clear its reported ambiguity; an empty teardown with
+ambiguous keys remains INCONCLUSIVE under the zero default.
 
 ## Oracle (replaces `postcheck.py`)
 
@@ -92,7 +106,7 @@ pre-declared, recorded in the report) the result is INCONCLUSIVE, never PASS.
 | none | topology: `GET /cluster/node` per endpoint and `GET /cluster/nodes` must cover the whole cluster, one node each |
 | none | leaders: `GET /cluster/channels/:id/:type/config` (not forwarded; only the slot leader answers 200, the body carries the channel leader as `learder_id`) records the serving slot and channel leader of every channel per mode, and restart modes report how many moved |
 | none | per-channel message accounting: seq starts at 1 and is contiguous within the channel, `max_message_seq` equals the last read seq, no duplicate `client_msg_no`, no unknown `client_msg_no`, payload and `from_uid` match, no message whose send was `rejected`/`not_sent` is persisted, every accepted (200) message is present; `unknown` sends are counted as present/absent and never fail the run |
-| 378 -> 0 by empty snapshot at revision 50,000,000 | `subscriber_remove_all` on every channel, then subscriber sets against the model (empty except uids with an ambiguous floating add), then probe + readback. "0" means empty subscriber sets: channels and channel cluster configs persist (no delete route is used; `messagesync` creates configs) |
+| 378 -> 0 by empty snapshot at revision 50,000,000 | `subscriber_remove_all` on every channel, then strict empty subscriber sets, model coverage, probe + readback. No ambiguous load-era write excuses a survivor. "0" means empty subscriber sets: channels and channel cluster configs persist (no delete route is used; `messagesync` creates configs) |
 | none | preflight: every channel has an empty subscriber set **and an empty `messagesync` readback**. `max_message_seq` alone answers 0 while the channel config is not loaded (`LeaderOfChannelForRead`), so it cannot prove there are no stale messages. Side effect: the readback creates channel configs. A fresh data directory per arm stays mandatory |
 | `restart` mode: probe + recovery drain | `restart` mode: subscriber sets, readback prefix byte-identical (sha256 of `seq,client_msg_no,message_id`) to the previous snapshot, only this restart's probes may follow, full accounting. The snapshot is rolled forward, so one arm can check several sequential restarts; T3's mid-load restarts are judged by `post` (README, per-arm table) |
 

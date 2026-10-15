@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -594,9 +595,18 @@ class TestClientTimeoutsAccounted(Base):
         self.assertEqual(rep["scope_errors"], {"ambiguous_ratio_above_threshold": 1})
         cov = rep["subscriber_coverage"]["post"]
         self.assertGreater(cov["ambiguous_ratio"], 0.01)
-        # with an explicitly widened scope the same state is consistent (no false FAIL)
-        argv_rep = self.o("teardown", "--max-ambiguous-ratio", "1.0")[1]
-        self.assertEqual((argv_rep["verdict"], argv_rep["fail"]), ("PASS", {}), argv_rep)
+        # Fixture-only widened model scope accepts exactly the possible states.
+        # Do not use teardown for this assertion: late load adds are a teardown
+        # defect even when their model state remains ambiguous (B3).
+        a = oracle.parse_args(["post", "--api", self.cluster.urls("api"),
+                               "--manager", self.cluster.urls("manager"), "--token-file", self.tok,
+                               "--state-dir", self.st, "--max-ambiguous-ratio", "1"] + SMALL)
+        o = oracle.Oracle(a)
+        try:
+            o.check_subscribers(oracle.model_from(self.st, "world_final.json"), "post")
+            self.assertEqual((o.verdict(), dict(o.fail)), ("PASS", {}))
+        finally:
+            o.client.close_all()
 
 
 class TestN4WholeRequestDeadline(Base):
@@ -703,7 +713,7 @@ class TestB2Transitions(unittest.TestCase):
 class TestB2OracleControls(Base):
     """End-to-end through seedcheck: model transitions written by the harness API, state mutated in the mock."""
 
-    def mutate(self, writes, drop=(), add=()):
+    def mutate(self, writes, drop=(), add=(), scope=None):
         self.assertEqual(self.h("--phase", "seed"), 0)
         wp = os.path.join(self.st, "world_seed.json")
         w = _json(wp)
@@ -719,7 +729,7 @@ class TestB2OracleControls(Base):
                 s.discard(u)
             for u in add:
                 s.add(u)
-        return self.o("seedcheck")
+        return self.o("seedcheck", *(["--max-ambiguous-ratio", scope] if scope is not None else []))
 
     def test_reviewer_x2_rejected_add_then_loss_fails(self):
         rc, rep = self.mutate([("u00001", world.ADD, "rejected", 400)], drop=["u00001"])
@@ -735,7 +745,7 @@ class TestB2OracleControls(Base):
         self.assertEqual(rep["fail"], {"missing_subscriber": 1})
 
     def test_ambiguous_remove_then_absent_passes_with_scope(self):
-        rc, rep = self.mutate([("u00001", world.REMOVE, "unknown", None)], drop=["u00001"])
+        rc, rep = self.mutate([("u00001", world.REMOVE, "unknown", None)], drop=["u00001"], scope="1")
         self.assertEqual(rep["verdict"], "PASS", rep)
         cov = rep["subscriber_coverage"]["seed"]
         self.assertEqual((cov["ambiguous_keys"], cov["ambiguous_absent"]), (1, 1))
@@ -750,7 +760,7 @@ class TestB2OracleControls(Base):
 
     def test_ordering_floating_add_then_confirmed_remove(self):
         rc, rep = self.mutate([("u77777", world.ADD, "unknown", None), ("u77777", world.REMOVE, "ok", 200)],
-                              add=["u77777"])
+                              add=["u77777"], scope="1")
         self.assertEqual(rep["verdict"], "PASS", rep)
 
     def test_ordering_floating_add_then_confirmed_add(self):
@@ -773,6 +783,135 @@ class TestConnectionRefusedIsNotSent(unittest.TestCase):
         s.close()
         r = common.Client("", 0.5).call("POST", "http://127.0.0.1:%d" % port, "/x", {})
         self.assertEqual((r.outcome, r.err), (common.NOT_SENT, "conn_refused"))
+
+
+class TestB3P1Correction(Base):
+    def prepare_ambiguous_final(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        self.assertEqual(self.h("--phase", "load", "--addremove", "1", "--send", "1",
+                                "--upsert", "0", "--seconds", "0.1"), 0)
+        wp = os.path.join(self.st, "world_final.json")
+        w = _json(wp)
+        m = world.SubscriberModel.from_json(w["model"])
+        m.apply("repro_g001", "u77777", world.ADD, world.AMBIGUOUS)
+        w["model"] = m.to_json()
+        with open(wp, "w") as f:
+            json.dump(w, f)
+
+    def test_reviewer_z2_teardown_surviving_ambiguous_uid_fails(self):
+        self.prepare_ambiguous_final()
+        self.assertEqual(self.o("post", "--max-ambiguous-ratio", "1")[1]["verdict"], "PASS")
+        original = oracle.Oracle.check_subscribers
+
+        def inject(o, model, label):
+            if label == "teardown":
+                with self.cluster.state.mu:
+                    self.cluster.state.subs.setdefault(("repro_g001", 2), set()).add("u77777")
+            return original(o, model, label)
+
+        # Explicitly widened scope is fixture-only: even it cannot excuse a survivor.
+        with mock.patch.object(oracle.Oracle, "check_subscribers", inject):
+            rc, rep = self.o("teardown", "--max-ambiguous-ratio", "1")
+        self.assertEqual(rep["teardown_outcomes"], {"ok": 6})
+        self.assertEqual((rc, rep["verdict"]), (1, "FAIL"), rep)
+        self.assertEqual(rep["fail"], {"not_empty_after_teardown": 1})
+
+    def test_one_ambiguous_key_is_inconclusive_by_default(self):
+        self.prepare_ambiguous_final()
+        rc, rep = self.o("post")
+        cov = rep["subscriber_coverage"]["post"]
+        self.assertEqual(cov["ambiguous_keys"], 1)
+        self.assertLess(cov["ambiguous_ratio"], 0.01)
+        self.assertEqual(cov["max_ambiguous_ratio"], 0)
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"), rep)
+
+    def test_empty_teardown_keeps_ambiguity_scope(self):
+        self.prepare_ambiguous_final()
+        rc, rep = self.o("teardown")
+        self.assertEqual(rep["teardown_outcomes"], {"ok": 6})
+        self.assertEqual(rep["fail"], {})
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"), rep)
+        self.assertEqual(rep["subscriber_coverage"]["teardown"]["ambiguous_present"], 0)
+
+    def test_load_write_denominator_and_ratio(self):
+        self.prepare_ambiguous_final()
+        rows = [
+            {"kind": "subscriber_add", "outcome": "ok"},
+            {"kind": "subscriber_add", "outcome": "unknown"},
+            {"kind": "subscriber_remove", "outcome": "rejected"},
+            {"kind": "message_send", "outcome": "not_sent"},
+            {"kind": "channel_info", "outcome": "unknown"},
+            {"kind": "seed", "outcome": "unknown"},  # never part of load
+        ]
+        with gzip.open(os.path.join(self.st, "load_journal.jsonl.gz"), "wt") as f:
+            for row in rows:
+                # Valid message-ledger fields for the one not-sent send.
+                if row["kind"] == "message_send":
+                    row.update(cmn="r1-s00-00000001", ch="repro_g001", **{"from": "u00000"})
+                f.write(json.dumps(row) + "\n")
+        # seedcheck reads this synthetic load accounting without message readback.
+        shutil.copyfile(os.path.join(self.st, "world_final.json"), os.path.join(self.st, "world_seed.json"))
+        rc, rep = self.o("seedcheck")
+        cov = rep["subscriber_coverage"]["seed"]
+        self.assertEqual(rep["load_write_accounting"]["outcomes"],
+                         {"ok": 1, "rejected": 1, "unknown": 2, "not_sent": 1})
+        self.assertEqual(rep["load_write_accounting"]["total"], 5)
+        self.assertEqual(rep["load_write_accounting"]["non_ok_ratio"], 0.8)
+        self.assertEqual(cov["non_ok_load_writes"], 4)
+        self.assertEqual(cov["ambiguous_keys"], 1)
+        self.assertEqual(cov["ambiguous_keys_per_non_ok_load_write"], 0.25)
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+
+    def test_zero_load_denominator_is_null(self):
+        self.prepare_ambiguous_final()
+        with gzip.open(os.path.join(self.st, "load_journal.jsonl.gz"), "wt") as f:
+            f.write(json.dumps({"kind": "subscriber_add", "outcome": "ok"}) + "\n")
+        shutil.copyfile(os.path.join(self.st, "world_final.json"), os.path.join(self.st, "world_seed.json"))
+        rc, rep = self.o("seedcheck")
+        cov = rep["subscriber_coverage"]["seed"]
+        self.assertEqual(cov["non_ok_load_writes"], 0)
+        self.assertEqual(rep["load_write_accounting"]["non_ok_ratio"], 0)
+        self.assertIsNone(cov["ambiguous_keys_per_non_ok_load_write"])
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+
+    def test_no_load_journal_reports_absence_and_undefined_ratio(self):
+        self.assertEqual(self.h("--phase", "seed"), 0)
+        rc, rep = self.o("seedcheck")
+        acct = rep["load_write_accounting"]
+        self.assertFalse(acct["journal_present"])
+        self.assertEqual((acct["total"], acct["non_ok"]), (0, 0))
+        self.assertIsNone(acct["non_ok_ratio"])
+        self.assertIsNone(rep["subscriber_coverage"]["seed"]["ambiguous_keys_per_non_ok_load_write"])
+        self.assertEqual((rc, rep["verdict"]), (0, "PASS"))
+
+    def test_non_ok_remove_all_fails(self):
+        self.prepare_ambiguous_final()
+        original = common.Client.call
+
+        def reject(client, method, base, path, *args, **kwargs):
+            if path == "/channel/subscriber_remove_all":
+                return common.Result(500, b"{}", 0, common.REJECTED, "http_500", 0)
+            return original(client, method, base, path, *args, **kwargs)
+
+        with mock.patch.object(common.Client, "call", reject):
+            rc, rep = self.o("teardown")
+        self.assertEqual((rc, rep["verdict"]), (1, "FAIL"))
+        self.assertEqual(rep["fail"]["teardown_not_ok"], 6)
+
+    def test_unreadable_teardown_cannot_pass(self):
+        self.prepare_ambiguous_final()
+        original = common.Client.call
+
+        def unreadable(client, method, base, path, *args, **kwargs):
+            if path.endswith("/subscribers"):
+                return common.Result(500, b"{}", 0, common.REJECTED, "http_500", 0)
+            return original(client, method, base, path, *args, **kwargs)
+
+        with mock.patch.object(common.Client, "call", unreadable):
+            rc, rep = self.o("teardown")
+        self.assertEqual(rep["teardown_outcomes"], {"ok": 6})
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"))
+        self.assertEqual(rep["read_errors"]["subscriber_read_node_error"], 6)
 
 
 if __name__ == "__main__":

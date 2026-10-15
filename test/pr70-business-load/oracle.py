@@ -18,8 +18,8 @@ Modes (--state-dir is shared with harness.py; per-arm sequences are in README.md
   restart    after a graceful restart (performed by the operator): health,
              subscriber sets, probe send on every channel, readback whose
              prefix is identical to the previous snapshot, full accounting
-  teardown   subscriber_remove_all on every channel, subscriber sets vs the
-             model, probe send on every channel, full accounting
+  teardown   subscriber_remove_all on every channel, strict empty subscriber
+             sets as well as model coverage, probe send, full accounting
              (378 -> 0 subscriber sets; channels and channel configs persist)
 
 Every mode first checks topology and records leaders:
@@ -43,7 +43,7 @@ Reads (all leader-served on PR70; follower replica state is NOT observable):
 Subscriber model: possible states per (channel, uid) (wkload/world.py). A uid
 must be present when P is its only possible state, absent when A is, and is
 unconstrained only when both are possible. The share of unconstrained keys is
-reported as the verdict scope; above --max-ambiguous-ratio (default 1%) the
+reported as the verdict scope; above --max-ambiguous-ratio (default zero) the
 result is INCONCLUSIVE, never PASS.
 
 Memory is bounded for multi-million message runs: the send ledger is kept as
@@ -87,6 +87,29 @@ OBSERVATION_LIMITS = [
     "0 -> 378 -> 0 refers to subscriber sets. Channels and channel cluster configs are never deleted.",
 ]
 OUTCOME = {v: k for k, v in CODE.items()}
+
+
+def load_write_accounting(state_dir):
+    """Count requests, not keys, in the complete load journal; exclude seed/probes.
+
+    The ambiguity numerator is a final key count, so its ratio to non-OK requests
+    is descriptive, not a probability or a causal attribution. Zero denominator
+    is undefined (JSON null), including seed-only ambiguity.
+    """
+    path = os.path.join(state_dir, "load_journal.jsonl.gz")
+    outcomes = {k: 0 for k in CODE}
+    present = os.path.exists(path)
+    if present:
+        for rec in read_journal(path):
+            if rec.get("kind") in ("subscriber_add", "subscriber_remove", "message_send", "channel_info"):
+                outcomes[rec["outcome"]] += 1
+    total = sum(outcomes.values())
+    non_ok = sum(n for k, n in outcomes.items() if k != OK)
+    return {"journal_present": present, "outcomes": outcomes, "total": total,
+            "non_ok": non_ok, "non_ok_ratio": round(non_ok / total, 6) if total else None,
+            "definition": "One request in load_journal per subscriber_add, subscriber_remove, message_send "
+                          "or channel_info; non_ok = rejected + unknown + not_sent. Seed, oracle probes "
+                          "and teardown requests are excluded. Missing journal is reported explicitly."}
 
 
 class Ledger:
@@ -200,6 +223,7 @@ class Oracle:
         self.read_errors = defaultdict(int)
         self.scope_errors = defaultdict(int)
         self.coverage = {}
+        self.load_writes = load_write_accounting(a.state_dir)
         self.examples = defaultdict(list)
 
     # ---------- bookkeeping ----------
@@ -410,6 +434,10 @@ class Oracle:
                 continue
             read += 1
             act = set(actual)
+            # All load requests have ended before teardown. A successful remove_all
+            # must leave no subscribers, even if an old load add was ambiguous.
+            if label == "teardown" and act:
+                self.bad("not_empty_after_teardown", {"ch": cid, "n": len(act), "uids": sorted(act)[:10]})
             missing, extra = [], []
             seen = set()
             for u, code in model.items(cid):
@@ -438,9 +466,14 @@ class Oracle:
                "certain_absent_touched_keys": certain_a, "ambiguous_keys": ambiguous,
                "ambiguous_present": amb_present, "ambiguous_absent": ambiguous - amb_present,
                "ambiguous_ratio": round(ratio, 6), "max_ambiguous_ratio": self.a.max_ambiguous_ratio,
+               "non_ok_load_writes": self.load_writes["non_ok"],
+               "ambiguous_keys_per_non_ok_load_write":
+                   round(ambiguous / self.load_writes["non_ok"], 6) if self.load_writes["non_ok"] else None,
                "scope": "PASS asserts presence of %d certain-present keys and absence of every other uid except "
                         "%d ambiguous keys (%.4f%% of %d touched keys), whose presence is not asserted"
                         % (certain_p, ambiguous, 100 * ratio, tracked)}
+        if label == "teardown":
+            cov["scope"] += "; teardown additionally requires every served subscriber set to be empty"
         self.coverage[label] = cov
         if ratio > self.a.max_ambiguous_ratio:
             self.scope_errors["ambiguous_ratio_above_threshold"] += 1
@@ -680,6 +713,7 @@ def check(o, a):
     rep["read_errors"] = dict(o.read_errors)
     rep["scope_errors"] = dict(o.scope_errors)
     rep["subscriber_coverage"] = o.coverage
+    rep["load_write_accounting"] = o.load_writes
     rep["observation_limits"] = OBSERVATION_LIMITS
     rep["info"] = dict(o.info)
     rep["examples"] = {k: v for k, v in o.examples.items()}
@@ -710,9 +744,9 @@ def parse_args(argv=None):
     ap.add_argument("--drain-timeout", type=float, default=600.0)
     ap.add_argument("--drain-interval", type=float, default=5.0)
     ap.add_argument("--restart-index", type=int, default=1)
-    ap.add_argument("--max-ambiguous-ratio", type=float, default=0.01,
+    ap.add_argument("--max-ambiguous-ratio", type=float, default=0.0,
                     help="pre-declared verdict scope: above this share of ambiguous subscriber keys the "
-                         "result is INCONCLUSIVE instead of PASS")
+                         "result is INCONCLUSIVE instead of PASS (default zero; nonzero requires Owner approval)")
     a = ap.parse_args(argv)
     if not a.run_id.isalnum():
         ap.error("--run-id must be alphanumeric")

@@ -44,9 +44,22 @@ Requirements: Python 3.9+ standard library only. No third-party packages.
 - **Subscriber scope.** Each subscriber check reports its coverage: certain-present, certain-absent
   and ambiguous keys. A uid with an ambiguous write (rejected or unknown, except a provable no-effect
   such as `not_sent` or HTTP 401) is constrained only to the states that write could produce. If the
-  ambiguous share of touched keys exceeds `--max-ambiguous-ratio` (default `0.01`), the result is
+  ambiguous share of touched keys exceeds `--max-ambiguous-ratio` (default **zero**), the result is
   INCONCLUSIVE instead of PASS. The threshold is pre-declared and recorded in every report. Changing
-  it is a PjM decision.
+  it to any nonzero value requires an Owner decision; no nonzero allowance is approved. The earlier
+  1% proposal is pending, not policy. A single ambiguous key makes the default result INCONCLUSIVE.
+  Reports include absolute `ambiguous_keys` in successfully read channels, the touched-key ratio, `non_ok_load_writes` and
+  `ambiguous_keys_per_non_ok_load_write`. The latter divides final ambiguous keys by the number of
+  `rejected` + `unknown` + `not_sent` load requests across subscriber add/remove, message send and
+  channel-info upsert. Seed, oracle probes and teardown writes are excluded. `load_write_accounting`
+  records the complete outcome counts, total, non-OK request share (`non_ok_ratio`) and journal availability. This keys/requests ratio is
+  descriptive, not a probability or causal attribution; repeated writes, seed ambiguity and narrowed
+  states mean it need not be at most one. With zero non-OK load writes it is JSON `null`, not zero.
+- **Strict teardown.** After successful `subscriber_remove_all`, every served subscriber set must
+  be empty, including uids with ambiguous load-era adds. Any survivor fails
+  `not_empty_after_teardown`, even with an explicitly widened scope. Non-OK remove-all fails
+  `teardown_not_ok`. The possible-state model and its coverage remain reported; scope errors can
+  still make an empty teardown INCONCLUSIVE. All load workers must have stopped before teardown.
 - **0 -> 378 -> 0** refers to subscriber sets. Channels and channel cluster configs are created by
   the workload, or by the preflight readback, and are never deleted.
 - **Timeouts.** The client timeout (`budget + 1` = 6 s; 7 s for seed; 8 s for oracle reads) is one
@@ -60,6 +73,8 @@ Requirements: Python 3.9+ standard library only. No third-party packages.
 Every arm starts on a fresh data directory, with its own new private `--state-dir` and an
 alphanumeric `--run-id`. The token file must be mode 0600. Pass every node of the topology, in the
 same order, to both `--api` and `--manager`. Arms run strictly sequentially.
+Run each oracle mode once per state directory (restart uses a new `--restart-index` each time):
+re-running a mode re-sends its probe client message ids and is not an independent check.
 
 ```sh
 H=test/pr70-business-load
