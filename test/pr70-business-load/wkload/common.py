@@ -4,12 +4,23 @@ Outcome model (applies to every write the harness issues):
 
   ok        HTTP 200 with a JSON body whose optional "status" field is 200.
   rejected  The server answered with any other HTTP status (or a non-200
-            "status" field). The write may still have been partially applied
+            "status" field in a status envelope, see below). The write may
+            still have been partially applied
             server-side (for example AddSubscribers succeeded and the later
             conversation update failed), so it is NOT proof of no effect.
   unknown   The request may have reached the server but no complete response
             was read (client timeout, reset, broken pipe). Effect unknown.
   not_sent  TCP connect failed before any byte was sent. Proven no effect.
+
+The HTTP status line is authoritative for transport/API success. A body
+"status" field is an application status only on envelope routes (c.ResponseOK,
+c.ResponseOKWithData, c.ResponseStatus in pkg/wkhttp/http.go: {"status":200,...}
+or HTTP 200 with an application error such as {"status":404}). Routes that
+answer with a bare model object (envelope=False: GET /cluster/node NodeConfig
+whose "status" is node membership, 3 = joined; GET /cluster/nodes; GET
+/cluster/channels/:id/:type/config ChannelClusterConfig) carry endpoint data
+in "status"; for them only the HTTP status decides the outcome and each caller
+validates the body shape and fails closed on anything unexpected.
 
 Nothing is retried. Every outcome is journaled and counted.
 """
@@ -151,7 +162,9 @@ class Client:
             except Exception:
                 pass
 
-    def call(self, method, base, path, obj=None, timeout=None):
+    def call(self, method, base, path, obj=None, timeout=None, envelope=True):
+        """One bounded request. envelope=False: the 200 body is a bare object whose
+        "status" field is endpoint data, never an application status (module doc)."""
         t_wall = time.time()
         t0 = time.monotonic()
         c = self._conn(base)
@@ -202,6 +215,8 @@ class Client:
         dt = time.monotonic() - t0
         if r.status != 200:
             return Result(r.status, body, dt, REJECTED, classify_error(r.status, body, None), t_wall)
+        if not envelope:
+            return Result(r.status, body, dt, OK, None, t_wall)
         try:
             j = json.loads(body.decode("utf-8")) if body else None
         except Exception:

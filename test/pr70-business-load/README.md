@@ -39,6 +39,10 @@ Requirements: Python 3.9+ standard library only. No third-party packages.
 - **Cross-node checks.** These verify forwarding consistency. Every configured node must return the
   same answer. Any node read error, an incomplete endpoint list or a mismatched `--api`/`--manager`
   pair is a read error, and the result is INCONCLUSIVE.
+- **Topology reads.** `GET /cluster/node(s)` bodies are bare `NodeConfig` objects whose `status` is
+  node membership (3 = joined), not an application status; only the HTTP status decides success and
+  the body must carry a positive integer `id` (ADAPTATION.md, XIN-2231). Membership status is recorded
+  in `topology.membership_status`, not gated.
 - **Leader records.** The serving slot leader and channel leader of every channel are recorded per
   mode in `leaders_<mode>.json`. Restart modes report how many slot leaders moved.
 - **Subscriber scope.** Each subscriber check reports its coverage: certain-present, certain-absent

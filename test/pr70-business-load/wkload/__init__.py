@@ -3,4 +3,4 @@
 Test-only tooling. Nothing in this package is imported by the server.
 """
 
-HARNESS_VERSION = "pr70-bl-1.2.0"
+HARNESS_VERSION = "pr70-bl-1.2.1"

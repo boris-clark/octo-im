@@ -914,5 +914,206 @@ class TestB3P1Correction(Base):
         self.assertEqual(rep["read_errors"]["subscriber_read_node_error"], 6)
 
 
+class _FixedResponder:
+    """Disposable 127.0.0.1 server answering every request with one (HTTP status, body)."""
+
+    def __init__(self, code, body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.t.start()
+
+    def get(self, envelope):
+        c = common.Client("", 2.0)
+        try:
+            return c.call("GET", self.url, "/x", envelope=envelope)
+        finally:
+            c.close_all()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.t.join(5)
+
+
+# Real PR70 GET /cluster/node body (NodeConfig, pkg/cluster/cluster/model.go): "status" is
+# cluster membership (types.NodeStatus 3 = joined), not an HTTP status.
+REAL_NODE = {"id": 1, "is_leader": 1, "role": 1, "cluster_addr": "tcp://10.0.0.1:11110",
+             "api_server_addr": "http://10.0.0.1:5001", "online": 1, "allow_vote": 1, "slot_count": 64,
+             "term": 1, "slot_leader_count": 64, "uptime": "3m", "app_version": "v2", "config_version": 9,
+             "status": 3, "status_format": "\u5df2\u52a0\u5165"}
+
+
+class TestResponseClassification(unittest.TestCase):
+    """XIN-2231: HTTP status is authoritative; body "status" is an application status only on envelope routes."""
+
+    def check(self, code, body, envelope, outcome, err=None):
+        srv = _FixedResponder(code, body if isinstance(body, bytes) else json.dumps(body).encode())
+        try:
+            r = srv.get(envelope)
+        finally:
+            srv.close()
+        self.assertEqual((r.status, r.outcome), (code, outcome))
+        if err is not None:
+            self.assertEqual(r.err, err)
+        return r
+
+    def test_real_node_shape_is_ok(self):
+        for st in (1, 2, 3):
+            r = self.check(200, dict(REAL_NODE, status=st), False, common.OK)
+            self.assertEqual((r.json()["id"], r.json()["status"]), (1, st))
+        omitted = dict(REAL_NODE)
+        del omitted["status"], omitted["status_format"]
+        self.check(200, omitted, False, common.OK)
+
+    def test_real_nodes_shape_is_ok(self):
+        body = {"total": 3, "data": [dict(REAL_NODE, id=k, status=3) for k in (1, 2, 3)]}
+        self.check(200, body, False, common.OK)
+
+    def test_envelope_routes_keep_application_errors(self):
+        self.check(200, {"status": 200}, True, common.OK)
+        self.check(200, {"status": 200, "data": {"message_id": 7}}, True, common.OK)
+        self.check(200, {"status": 404}, True, common.REJECTED, "server_status_field")
+        self.check(200, {"msg": "bad", "status": 500}, True, common.REJECTED, "server_status_field")
+
+    def test_genuine_http_errors_rejected_on_both_route_kinds(self):
+        for env in (True, False):
+            self.check(400, {"msg": "slot leader is not current node", "status": 400}, env, common.REJECTED,
+                       "http_400_leader")
+            self.check(500, {"msg": "x", "status": 500}, env, common.REJECTED, "http_500")
+            self.check(401, b"", env, common.REJECTED, "http_401")
+            self.check(400, dict(REAL_NODE), env, common.REJECTED)
+
+
+class TestRealNodeResponseShape(Base):
+    """XIN-2231 PRE regression: real /cluster/node(s) bodies carry membership "status": 3."""
+
+    def check_topology(self, rep, n):
+        self.assertEqual(rep["verdict"], "PASS", rep)
+        self.assertEqual(rep["read_errors"], {})
+        topo = rep["topology"]
+        self.assertEqual(sorted(topo["api"].values()), list(range(1, n + 1)))
+        self.assertEqual(sorted(topo["manager"].values()), list(range(1, n + 1)))
+        self.assertEqual(topo["cluster_nodes"], list(range(1, n + 1)))
+        self.assertEqual(topo["membership_status"], {str(k): 3 for k in range(1, n + 1)})
+        self.assertEqual(rep["leaders"]["channels_identified"], 6)
+
+    def test_mock_serves_real_shape(self):
+        c = common.Client(TOKEN, 2.0)
+        try:
+            j = c.call("GET", self.cluster.urls("manager").split(",")[0], "/cluster/node", envelope=False).json()
+        finally:
+            c.close_all()
+        self.assertEqual((j["id"], j["status"], j["online"]), (1, 3, 1))
+
+    def test_preflight_single_node(self):
+        rc, rep = self.o("preflight")
+        self.assertEqual(rc, 0)
+        self.check_topology(rep, 1)
+
+    def test_full_sequence_single_node(self):
+        rc, rep = self.full_green()
+        self.assertEqual(rc, 0)
+        self.check_topology(rep, 1)
+
+
+class TestRealNodeResponseShapeThreeNode(TestRealNodeResponseShape):
+    nodes = 3
+
+    def test_preflight_single_node(self):
+        rc, rep = self.o("preflight")
+        self.assertEqual(rc, 0)
+        self.check_topology(rep, 3)
+
+    def test_full_sequence_single_node(self):
+        rc, rep = self.full_green()
+        self.assertEqual(rc, 0)
+        self.check_topology(rep, 3)
+
+
+class TestMembershipStatusValuesAreData(Base):
+    """will-join (1), joining (2) and omitted (0) membership values are recorded, never read as HTTP status."""
+
+    def test(self):
+        for st, rec in ((1, 1), (2, 2), (None, None)):
+            self.cluster.state.faults["node_status"] = st
+            rc, rep = self.o("preflight")
+            self.assertEqual((rc, rep["verdict"]), (0, "PASS"), rep)
+            self.assertEqual(rep["topology"]["membership_status"], {"1": rec})
+
+
+class TestCandidateChannelConfigIsLeaderClaim(Base):
+    """ChannelClusterConfig "status": 1 (candidate) is endpoint data on the leader's 200 answer."""
+    nodes = 3
+    faults = {"channel_config_status": 1}
+
+    def test(self):
+        rc, rep = self.o("preflight")
+        self.assertEqual((rc, rep["verdict"]), (0, "PASS"), rep)
+        self.assertEqual(rep["leaders"]["channels_identified"], 6)
+
+
+class TestNodeReadErrorsFailClosed(Base):
+    """Genuine HTTP errors, application error objects and malformed bodies stay INCONCLUSIVE."""
+    nodes = 3
+
+    def run_pre(self, **faults):
+        self.cluster.state.faults.update(faults)
+        rc, rep = self.o("preflight")
+        self.assertEqual((rc, rep["verdict"]), (3, "INCONCLUSIVE"), rep)
+        return rep
+
+    def test_http_400(self):
+        rep = self.run_pre(node_status_400=True)
+        self.assertEqual(rep["read_errors"]["node_identity"], 6)
+        self.assertIn("topology_incomplete", rep["read_errors"])
+        self.assertEqual({e["http"] for e in rep["examples"]["read_error:node_identity"]}, {400})
+
+    def test_http_200_application_error(self):
+        rep = self.run_pre(node_app_error=True)
+        self.assertEqual(rep["read_errors"]["node_identity"], 6)
+        self.assertIn("topology_incomplete", rep["read_errors"])
+
+    def test_malformed_body(self):
+        rep = self.run_pre(node_malformed=True)
+        self.assertEqual(rep["read_errors"]["node_identity"], 6)
+        self.assertEqual({e["err"] for e in rep["examples"]["read_error:node_identity"]}, {"malformed_node_body"})
+
+    def test_nodes_entry_without_id(self):
+        rep = self.run_pre(nodes_malformed_entry="no_id")
+        self.assertEqual(rep["read_errors"], {"cluster_nodes_unreadable": 1})
+
+    def test_nodes_entry_with_invalid_id(self):
+        rep = self.run_pre(nodes_malformed_entry="zero_id")
+        self.assertEqual(rep["read_errors"], {"cluster_nodes_unreadable": 1})
+
+    def test_channel_config_application_error(self):
+        rep = self.run_pre(channel_config_app_error=True)
+        self.assertEqual(rep["read_errors"], {"leader_identification": 6})
+
+    def test_unreachable_node_endpoint(self):
+        ap = self.cluster.urls("api").split(",")
+        ap[2] = "http://127.0.0.1:%d" % free_port()
+        rc, rep = self.o("preflight", api=",".join(ap))
+        self.assertNotEqual(rep["verdict"], "PASS")
+        self.assertIn("node_identity", rep["read_errors"])
+
+
 if __name__ == "__main__":
     unittest.main()

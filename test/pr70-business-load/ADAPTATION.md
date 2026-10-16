@@ -43,7 +43,7 @@ driver keeps the same counters and adds:
 
 * a complete gzip JSONL journal of every request (`seed_journal`, `load_journal`);
 * four outcomes per request: `ok`, `rejected` (HTTP answer other than 200, or a
-  non-200 `status` field), `unknown` (no complete response; may have applied),
+  non-200 `status` field on a status-envelope route), `unknown` (no complete response; may have applied),
   `not_sent` (TCP connect failed; proven no effect);
 * a PR70 error taxonomy (`client_timeout`, `conn_refused`, `conn_reset`,
   `http_<code>`, `http_<code>_propose_timeout`, `http_<code>_context_deadline`, ...).
@@ -145,3 +145,18 @@ independent stored readback, including after restart. Invalid/duplicate stored I
 mismatch FAIL even if a fresh snapshot would otherwise bless them. This relies only on the
 unique, unretried client-number workload and the verified product ID-to-storage contract; it
 introduces no global contiguous-ID assumption. Resource and evidence limits are in README.
+
+## HTTP status versus body `status` (XIN-2231)
+
+The HTTP status line is authoritative for transport/API success. A body `status` field is an
+application status only on status-envelope routes (`ResponseOK`, `ResponseOKWithData`,
+`ResponseStatus` in `pkg/wkhttp/http.go`), where HTTP 200 with e.g. `{"status":404}` stays
+`rejected`. `GET /cluster/node`, `GET /cluster/nodes` and `GET /cluster/channels/:id/:type/config`
+answer bare model objects (`NodeConfig`, `ChannelClusterConfig`) whose `status` is endpoint data:
+node membership (`types.NodeStatus`, 3 = joined) and channel cluster state (1 = candidate). The
+oracle reads them with `envelope=False`, so only the HTTP status decides the outcome, and then
+validates the body: a node object needs a positive integer `id`, every `/cluster/nodes` entry
+needs one (distinct), and a channel config claim must be a JSON object without `msg`. Anything else
+remains a read error (INCONCLUSIVE). Membership status is recorded in the topology report, not
+gated. Up to 1.2.0 the real `status: 3` was read as an application error and PRE was INCONCLUSIVE
+with `topology_incomplete` on every real cluster; the mock now serves the real shapes.

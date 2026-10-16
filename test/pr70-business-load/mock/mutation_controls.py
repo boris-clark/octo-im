@@ -5,7 +5,8 @@ Each mutation is applied to a disposable copy of this directory and must make
 its target tests FAIL ("killed"). The unmutated copy must pass the same tests
 first. Mutations reintroduce the XIN-2204 blockers (fail-open node reads,
 missing topology check, sticky-unchecked ambiguity, rejected-as-no-effect,
-no scope threshold) and other oracle checks.
+no scope threshold), the XIN-2231 body-status/HTTP-status confusion and other
+oracle checks.
 
 usage: mutation_controls.py [--json-out PATH]
 """
@@ -24,8 +25,8 @@ MUTATIONS = [
      'self.rerr("subscriber_read_node_error"', '(lambda *a: None)("subscriber_read_node_error"',
      ["test_harness.TestB1UnreachableNodeIsInconclusive.test_unreachable_manager"]),
     ("M2_B1_topology_check_removed", "oracle.py",
-     'out = {"api": {}, "manager": {}, "cluster_nodes": None}',
-     'out = {"api": {}, "manager": {}, "cluster_nodes": None}\n        return out',
+     'out = {"api": {}, "manager": {}, "cluster_nodes": None, "membership_status": {}}',
+     'out = {"api": {}, "manager": {}, "cluster_nodes": None, "membership_status": {}}\n        return out',
      ["test_harness.TestB1OmittedManagerIsInconclusive"]),
     ("M3_B1_forwarding_mismatch_ignored", "oracle.py",
      "if sorted(v) != canon:", "if False:",
@@ -88,6 +89,15 @@ MUTATIONS = [
      '"journal_complete": True,',
      ["test_evidence.TestJournalFailures.test_failed_writer_invalidates_final_and_exit",
       "test_evidence.TestJournalFailures.test_close_failure_invalidates_final_and_exit"]),
+    ("M21_body_status_treated_as_http_status", "wkload/common.py",
+     "        if not envelope:\n            return Result(r.status, body, dt, OK, None, t_wall)\n", "",
+     ["test_harness.TestRealNodeResponseShape", "test_harness.TestResponseClassification"]),
+    ("M22_node_identity_shape_unchecked", "oracle.py",
+     "if isinstance(v, int) and not isinstance(v, bool) and v > 0:", "if v is not None:",
+     ["test_harness.TestNodeReadErrorsFailClosed.test_nodes_entry_with_invalid_id"]),
+    ("M23_channel_config_app_error_claims_leader", "oracle.py",
+     'if isinstance(j, dict) and "msg" not in j:', "if r.outcome == OK:",
+     ["test_harness.TestNodeReadErrorsFailClosed.test_channel_config_application_error"]),
 
 ]
 

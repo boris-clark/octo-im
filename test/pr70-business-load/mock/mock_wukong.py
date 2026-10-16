@@ -18,11 +18,15 @@ forwarding read from PR70 source at bbc2be61 / a9021588 (identical there):
           errors: HTTP 400 {"msg","status":400}; missing/wrong token: HTTP 401
   API and manager (ServerAPI is mounted on both, internal/api/server_http.go:147,
   server_manager.go:119):
-          GET  /cluster/node                    {"id", "api_server_addr"}
-          GET  /cluster/nodes                   {"total", "data":[{"id","online"}]}
+          GET  /cluster/node                    bare NodeConfig object (api_node.go nodeGet,
+                                                 model.go NodeConfig): "id", "role", "online",
+                                                 ..., membership "status":3 (joined) - NOT an
+                                                 HTTP status envelope
+          GET  /cluster/nodes                   {"total", "data":[NodeConfig, ...]}
           GET  /cluster/channels/<id>/<type>/subscribers   JSON array; non-leader forwards
                                                  to leader api_server_addr (api_channel.go:242)
-          GET  /cluster/channels/<id>/<type>/config   leader: 200 config with "learder_id";
+          GET  /cluster/channels/<id>/<type>/config   leader: 200 bare ChannelClusterConfig
+                                                 with "learder_id" (and "status" when non-zero);
                                                  non-leader: 400 "slot leader is not current node"
   Manager GET  /metrics (no auth), /varz
 
@@ -53,6 +57,15 @@ Fault switches (dict) drive the deterministic red/limitation controls:
   stale_message_channel  channel pre-populated with a message whose config is not loaded
   unhealthy           /health returns 500
   messagesync_500     message reads fail with HTTP 500
+  node_status         membership "status" served in NodeConfig (default 3 = joined;
+                      None omits it like omitempty for 0)
+  node_status_400     /cluster/node answers HTTP 400 {"msg","status":400}
+  node_app_error      /cluster/node answers HTTP 200 {"msg","status":500} (application error)
+  node_malformed      /cluster/node answers HTTP 200 with a non-JSON body
+  nodes_malformed_entry  /cluster/nodes "data" holds an extra entry: "no_id" or "zero_id"
+  channel_config_status  "status" served in ChannelClusterConfig (1 = candidate)
+  channel_config_app_error  leader answers the channel config read with HTTP 200
+                      {"msg","status":500}
 """
 import argparse
 import http.client
@@ -101,6 +114,22 @@ class State:
         if self.faults.get("leader_override") is not None:
             return int(self.faults["leader_override"])
         return (zlib.crc32(cid.encode()) % 64) % self.nodes
+
+    def node_config(self, k):
+        """NodeConfig as served by GET /cluster/node and in GET /cluster/nodes "data".
+
+        Field names follow pkg/cluster/cluster/model.go NodeConfig; "status" is the
+        cluster membership state (types.NodeStatus: 1 will-join, 2 joining, 3 joined),
+        omitted when 0."""
+        n = {"id": k + 1, "is_leader": 1 if k == 0 else 0, "role": 1, "cluster_addr": "tcp://127.0.0.1:%d" % (11110 + k),
+             "api_server_addr": self.api_urls[k] if k < len(self.api_urls) else "", "online": 1,
+             "allow_vote": 1, "slot_count": 64, "term": 1, "slot_leader_count": 64 // self.nodes,
+             "uptime": "1m0s", "app_version": "mock", "config_version": 7}
+        st = self.faults.get("node_status", 3)
+        if st:
+            n["status"] = st
+            n["status_format"] = {1: "将加入", 2: "加入中", 3: "已加入"}.get(st, "")
+        return n
 
     def view(self, node, key):
         """Subscriber set as stored on `node`'s local replica."""
@@ -228,10 +257,20 @@ def make_handler(state, node_index, role):
             if u.path == "/varz":
                 return self._send(200, {"goroutine": 1, "mem": 1, "cpu": 0.0, "connections": 0})
             if u.path == "/cluster/node":
-                return self._send(200, {"id": node_index + 1, "api_server_addr": state.api_urls[node_index]})
+                if f.get("node_status_400"):
+                    return self._err("injected node error")
+                if f.get("node_app_error"):
+                    return self._send(200, {"msg": "injected application error", "status": 500})
+                if f.get("node_malformed"):
+                    return self._send(200, b"<html>not json</html>")
+                return self._send(200, state.node_config(node_index))
             if u.path == "/cluster/nodes":
-                return self._send(200, {"total": state.nodes,
-                                        "data": [{"id": k + 1, "online": 1} for k in range(state.nodes)]})
+                data = [state.node_config(k) for k in range(state.nodes)]
+                if f.get("nodes_malformed_entry") == "no_id":
+                    data.append({"status": 3, "online": 1})
+                elif f.get("nodes_malformed_entry") == "zero_id":
+                    data.append({"id": 0, "status": 3, "online": 1})
+                return self._send(200, {"total": len(data), "data": data})
             if role == "api" and u.path == "/channel/max_message_seq":
                 key = (q.get("channel_id", ""), int(q.get("channel_type", "0")))
                 leader = state.leader(key[0])
@@ -256,11 +295,16 @@ def make_handler(state, node_index, role):
                 key = (m.group(1), int(m.group(2)))
                 if state.leader(key[0]) != node_index:
                     return self._err("slot leader is not current node")
+                if f.get("channel_config_app_error"):
+                    return self._send(200, {"msg": "injected application error", "status": 500})
                 with state.mu:
                     if key not in state.configs:
                         return self._err("not found")
-                return self._send(200, {"channel_id": key[0], "channel_type": key[1], "learder_id": node_index + 1,
-                                        "replicas": [k + 1 for k in range(state.nodes)]})
+                cfg = {"channel_id": key[0], "channel_type": key[1], "learder_id": node_index + 1,
+                       "replicas": [k + 1 for k in range(state.nodes)]}
+                if f.get("channel_config_status"):
+                    cfg["status"] = int(f["channel_config_status"])
+                return self._send(200, cfg)
             self._send(404, {"msg": "404 page not found"})
 
         def do_POST(self):

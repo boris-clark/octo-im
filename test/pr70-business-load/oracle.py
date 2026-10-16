@@ -25,7 +25,10 @@ Modes (--state-dir is shared with harness.py; per-arm sequences are in README.md
 Every mode first checks topology and records leaders:
   topology   one --manager per --api, same node (GET /cluster/node ids), distinct
              ids, and the set equals GET /cluster/nodes; anything else is a read
-             error (INCONCLUSIVE)
+             error (INCONCLUSIVE). Both answer bare NodeConfig objects whose
+             "status" is node membership (3 = joined), not an HTTP/application
+             status; HTTP status decides success and the body must carry a
+             positive integer "id" (membership status is recorded, not gated)
   leaders    GET /cluster/channels/:id/:type/config on every node (not forwarded;
              only the slot leader answers 200) records the serving slot leader and
              channel leader of every channel in leaders_<mode>.json; restart modes
@@ -184,27 +187,36 @@ class Oracle:
 
         --api[i] and --manager[i] must be the same node (GET /cluster/node ids match),
         node ids must be distinct, and their set must equal the node list reported by
-        GET /cluster/nodes (which also lists offline nodes)."""
-        out = {"api": {}, "manager": {}, "cluster_nodes": None}
+        GET /cluster/nodes (which also lists offline nodes).
+
+        Both routes answer with bare NodeConfig objects (api_node.go nodeGet/nodesGet),
+        not a status envelope: their "status" is node membership (3 = joined), so they
+        are read with envelope=False. HTTP status decides success; a body without a
+        positive integer "id" (application error object, malformed JSON) is a read error."""
+        out = {"api": {}, "manager": {}, "cluster_nodes": None, "membership_status": {}}
         if len(self.managers) != len(self.apis):
             self.rerr("endpoint_mapping_incomplete", {"api": len(self.apis), "manager": len(self.managers)})
-        for i, ep in enumerate(self.apis):
-            r = self.client.call("GET", ep, "/cluster/node")
+
+        def node_read(ep):
+            r = self.client.call("GET", ep, "/cluster/node", envelope=False)
             j = r.json() if r.outcome == OK else None
-            if isinstance(j, dict) and isinstance(j.get("id"), int):
-                self.node_ids[ep] = j["id"]
-                out["api"][ep] = j["id"]
+            nid = _node_id(j)
+            if nid is None:
+                self.rerr("node_identity", {"ep": ep, "http": r.status, "err": r.err or "malformed_node_body"})
             else:
-                self.rerr("node_identity", {"ep": ep, "http": r.status, "err": r.err})
+                out["membership_status"][nid] = j.get("status")
+            return nid
+
+        for i, ep in enumerate(self.apis):
+            nid = node_read(ep)
+            if nid is not None:
+                self.node_ids[ep] = nid
+                out["api"][ep] = nid
             if i < len(self.managers):
                 m = self.managers[i]
-                r = self.client.call("GET", m, "/cluster/node")
-                jm = r.json() if r.outcome == OK else None
-                mid = jm.get("id") if isinstance(jm, dict) else None
+                mid = node_read(m)
                 out["manager"][m] = mid
-                if mid is None:
-                    self.rerr("node_identity", {"ep": m, "http": r.status, "err": r.err})
-                elif ep in self.node_ids and mid != self.node_ids[ep]:
+                if mid is not None and ep in self.node_ids and mid != self.node_ids[ep]:
                     self.rerr("endpoint_mapping_mismatch", {"api": ep, "api_node": self.node_ids[ep],
                                                             "manager": m, "manager_node": mid})
         ids = list(self.node_ids.values())
@@ -212,11 +224,14 @@ class Oracle:
             self.rerr("endpoint_mapping_duplicate_node", {"ids": ids})
         cluster = None
         for ep in self.apis:
-            r = self.client.call("GET", ep, "/cluster/nodes")
+            r = self.client.call("GET", ep, "/cluster/nodes", envelope=False)
             j = r.json() if r.outcome == OK else None
-            if isinstance(j, dict) and isinstance(j.get("data"), list):
-                cluster = sorted(n.get("id") for n in j["data"] if isinstance(n, dict))
-                break
+            data = j.get("data") if isinstance(j, dict) else None
+            if isinstance(data, list) and data:
+                got = [_node_id(n) for n in data]
+                if None not in got and len(set(got)) == len(got):
+                    cluster = sorted(got)
+                    break
         out["cluster_nodes"] = cluster
         if cluster is None:
             self.rerr("cluster_nodes_unreadable", {})
@@ -236,9 +251,9 @@ class Oracle:
             claim = []
             ch_leader = None
             for ep in self.apis:
-                r = self.client.call("GET", ep, "/cluster/channels/%s/%d/config" % (cid, ctype))
-                if r.outcome == OK:
-                    j = r.json() or {}
+                r = self.client.call("GET", ep, "/cluster/channels/%s/%d/config" % (cid, ctype), envelope=False)
+                j = r.json() if r.outcome == OK else None
+                if isinstance(j, dict) and "msg" not in j:
                     claim.append(self.node_ids.get(ep, ep))
                     ch_leader = j.get("learder_id")
                 elif r.status == 400 and b"slot leader is not current node" in r.body:
@@ -554,6 +569,15 @@ class Oracle:
 
     def snapshot_path(self):
         return os.path.join(self.a.state_dir, "readback_snapshot.json")
+
+
+def _node_id(j):
+    """Positive integer "id" of a NodeConfig object, else None (fail closed)."""
+    if isinstance(j, dict):
+        v = j.get("id")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return None
 
 
 def _count(it):
