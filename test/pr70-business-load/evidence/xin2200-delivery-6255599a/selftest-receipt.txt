@@ -1,0 +1,193 @@
+# commit 6255599a3de8602b250f684826b0df19edc7b946 (clean git archive export)
+# host: Darwin arm64, python 3.9.6, started 2026-10-15T07:30:24Z
+== manifest
+.gitignore: OK
+ADAPTATION.md: OK
+README.md: OK
+analyze.py: OK
+harness.py: OK
+mock/fullscale_dryrun.py: OK
+mock/mock_wukong.py: OK
+monitor_run.py: OK
+oracle.py: OK
+original/SHA256SUMS: OK
+original/analyze.py: OK
+original/harness.py: OK
+original/monitor_run.py: OK
+original/poller.py: OK
+original/postcheck.py: OK
+poller.py: OK
+selftest.sh: OK
+tests/test_harness.py: OK
+wkload/__init__.py: OK
+wkload/common.py: OK
+wkload/world.py: OK
+== python: 3.9.6
+== verbatim originals
+harness.py: OK
+postcheck.py: OK
+poller.py: OK
+monitor_run.py: OK
+analyze.py: OK
+== unit tests and negative controls
+test (test_harness.TestClientTimeoutsAccounted) ... ok
+test (test_harness.TestConnectionRefusedIsNotSent) ... ok
+test_adapted_tools_never_call_removed_routes (test_harness.TestDefaultsAndProvenance) ... ok
+test_defaults_preserve_historical_shape (test_harness.TestDefaultsAndProvenance) ... ok
+test_no_token_argv_option (test_harness.TestDefaultsAndProvenance) ... ok
+test_originals_are_verbatim (test_harness.TestDefaultsAndProvenance) ... ok
+test_no_shared_global_rng (test_harness.TestDeterminism) ... ok
+test_stream_stable_across_processes (test_harness.TestDeterminism) ... ok
+test_streams_differ_by_seed_and_worker (test_harness.TestDeterminism) ... ok
+test_streams_identical_for_same_seed (test_harness.TestDeterminism) ... ok
+test_accounting_is_complete (test_harness.TestGreenSingle) ... ok
+test_full_sequence_with_two_restarts (test_harness.TestGreenSingle) ... ok
+test_seed_pages_at_128 (test_harness.TestGreenSingle) ... ok
+test_three_endpoints_and_full_sequence (test_harness.TestGreenThreeNode) ... ok
+test_monitor_is_bounded (test_harness.TestObservabilityTools) ... ok
+test_poller_monitor_analyze (test_harness.TestObservabilityTools) ... ok
+test (test_harness.TestReadFailureIsInconclusiveNotPass) ... ok
+test (test_harness.TestRedDivergentNode) ... ok
+test (test_harness.TestRedDuplicateMessage) ... ok
+test (test_harness.TestRedDuplicateSubscriber) ... ok
+test (test_harness.TestRedMissingMessage) ... ok
+test (test_harness.TestRedMissingSubscriber) ... ok
+test (test_harness.TestRedRejectedButPersisted) ... ok
+test (test_harness.TestRedRestartLoss) ... ok
+test (test_harness.TestRedSeqGap) ... ok
+test (test_harness.TestRedStaleState) ... ok
+test (test_harness.TestRedUnexpectedMember) ... ok
+test (test_harness.TestRedUnexpectedMessage) ... ok
+test (test_harness.TestRedUnhealthy) ... ok
+test (test_harness.TestRejectedWritesAccounted) ... ok
+test_rejects_group_readable_token (test_harness.TestToken) ... ok
+test_token_never_written (test_harness.TestToken) ... ok
+test_wrong_token_aborts_before_load (test_harness.TestToken) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 56.501s
+
+OK
+== full default-shape dry run, 1 node, 60s load
+rc=0 oracle.py preflight :: {"mode": "preflight", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 harness.py --phase :: SEED done in 0.1s: 420/420 pages ok
+rc=0 oracle.py seedcheck :: {"mode": "seedcheck", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 harness.py --phase :: FINAL: {"subscriber_remove": {"n": 110075, "outcome": {"ok": 110075, "rejected": 0, "unknown": 0, "not_sent": 0}}, "subscriber_add": {"n": 110314, "outcome": {"ok": 110314, "rejected": 0, "unknown": 0, "not_sent": 0}}, "message_send": {"n": 219871, "outcome": {"ok": 219871, "rejected": 0, "unknown":
+rc=0 oracle.py post :: {"mode": "post", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py restart :: {"mode": "restart1", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py restart :: {"mode": "restart2", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py teardown :: {"mode": "teardown", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 analyze.py --state-dir :: === oracle_teardown.json: PASS fail={} read_errors={}
+{
+ "results": [
+  {
+   "cmd": "oracle.py preflight",
+   "rc": 0,
+   "last": "{\"mode\": \"preflight\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "harness.py --phase",
+   "rc": 0,
+   "last": "SEED done in 0.1s: 420/420 pages ok"
+  },
+  {
+   "cmd": "oracle.py seedcheck",
+   "rc": 0,
+   "last": "{\"mode\": \"seedcheck\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "harness.py --phase",
+   "rc": 0,
+   "last": "FINAL: {\"subscriber_remove\": {\"n\": 110075, \"outcome\": {\"ok\": 110075, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"subscriber_add\": {\"n\": 110314, \"outcome\": {\"ok\": 110314, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"message_send\": {\"n\": 219871, \"outcome\": {\"ok\": 219871, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"channel_info\": {\"n\": 84070, \"outcome\": {\"ok\": 84070, \"rejected\": 0, \"unknown\":"
+  },
+  {
+   "cmd": "oracle.py post",
+   "rc": 0,
+   "last": "{\"mode\": \"post\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py restart",
+   "rc": 0,
+   "last": "{\"mode\": \"restart1\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py restart",
+   "rc": 0,
+   "last": "{\"mode\": \"restart2\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py teardown",
+   "rc": 0,
+   "last": "{\"mode\": \"teardown\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "analyze.py --state-dir",
+   "rc": 0,
+   "last": "=== oracle_teardown.json: PASS fail={} read_errors={}"
+  }
+ ],
+ "token_leaks": []
+}
+== full default-shape dry run, 3 nodes, 60s load
+rc=0 oracle.py preflight :: {"mode": "preflight", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 harness.py --phase :: SEED done in 0.1s: 420/420 pages ok
+rc=0 oracle.py seedcheck :: {"mode": "seedcheck", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 harness.py --phase :: FINAL: {"subscriber_remove": {"n": 109826, "outcome": {"ok": 109826, "rejected": 0, "unknown": 0, "not_sent": 0}}, "subscriber_add": {"n": 110047, "outcome": {"ok": 110047, "rejected": 0, "unknown": 0, "not_sent": 0}}, "message_send": {"n": 219608, "outcome": {"ok": 219608, "rejected": 0, "unknown":
+rc=0 oracle.py post :: {"mode": "post", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py restart :: {"mode": "restart1", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py restart :: {"mode": "restart2", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 oracle.py teardown :: {"mode": "teardown", "verdict": "PASS", "fail": {}, "read_errors": {}}
+rc=0 analyze.py --state-dir :: === oracle_teardown.json: PASS fail={} read_errors={}
+{
+ "results": [
+  {
+   "cmd": "oracle.py preflight",
+   "rc": 0,
+   "last": "{\"mode\": \"preflight\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "harness.py --phase",
+   "rc": 0,
+   "last": "SEED done in 0.1s: 420/420 pages ok"
+  },
+  {
+   "cmd": "oracle.py seedcheck",
+   "rc": 0,
+   "last": "{\"mode\": \"seedcheck\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "harness.py --phase",
+   "rc": 0,
+   "last": "FINAL: {\"subscriber_remove\": {\"n\": 109826, \"outcome\": {\"ok\": 109826, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"subscriber_add\": {\"n\": 110047, \"outcome\": {\"ok\": 110047, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"message_send\": {\"n\": 219608, \"outcome\": {\"ok\": 219608, \"rejected\": 0, \"unknown\": 0, \"not_sent\": 0}}, \"channel_info\": {\"n\": 83637, \"outcome\": {\"ok\": 83637, \"rejected\": 0, \"unknown\":"
+  },
+  {
+   "cmd": "oracle.py post",
+   "rc": 0,
+   "last": "{\"mode\": \"post\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py restart",
+   "rc": 0,
+   "last": "{\"mode\": \"restart1\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py restart",
+   "rc": 0,
+   "last": "{\"mode\": \"restart2\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "oracle.py teardown",
+   "rc": 0,
+   "last": "{\"mode\": \"teardown\", \"verdict\": \"PASS\", \"fail\": {}, \"read_errors\": {}}"
+  },
+  {
+   "cmd": "analyze.py --state-dir",
+   "rc": 0,
+   "last": "=== oracle_teardown.json: PASS fail={} read_errors={}"
+  }
+ ],
+ "token_leaks": []
+}
+== SELFTEST PASS (work dir /tmp/pr70bl-selftest.hMnz8x)
+exit=0
+# finished 2026-10-15T07:34:24Z

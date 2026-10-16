@@ -1,0 +1,28 @@
+{
+ "X0_diverged_node_omitted_from_manager_list": [
+  0,
+  "PASS",
+  {},
+  {}
+ ],
+ "X1_diverged_node_unreachable": [
+  0,
+  "PASS",
+  {},
+  {},
+  {
+   "subscriber_read_node_error:http://127.0.0.1:58914": 6
+  }
+ ],
+ "X2_loss_masked_by_rejected_add": [
+  0,
+  "PASS",
+  {},
+  1
+ ],
+ "X3a_page2_with_more": [
+  0,
+  "PASS",
+  {}
+ ]
+}
