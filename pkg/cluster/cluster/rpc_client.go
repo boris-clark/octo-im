@@ -192,6 +192,9 @@ func (r *rpcClient) RequestChannelLastLogInfo(ctx context.Context, nodeId uint64
 		return nil, err
 	}
 
+	if result != nil && result.Status == slotReplicaDiverged {
+		return nil, fmt.Errorf("%w: %w: node %d: %s", ErrConversationReadRetry, rafttypes.ErrSlotDiverged, nodeId, result.Body)
+	}
 	if result == nil || result.Status != proto.StatusOK {
 		return nil, ErrConversationReadRetry
 	}
