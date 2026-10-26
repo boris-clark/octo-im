@@ -45,6 +45,15 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 		// Leader hand-off by role switch keeps the term (learner) or bypasses
 		// the healthy-quorum election; slot leadership changes only by election.
 		raft.WithLeaderRoleSwitchDisabled(true),
+		// Storage raises the read fence before it writes the marker; this
+		// keeps the registry in step with every other quarantine path.
+		raft.WithOnQuarantine(func(failStop bool, why string) {
+			to := ReplicaQuarantined
+			if failStop {
+				to = ReplicaFailStopped
+			}
+			s.quarantine(slot.Id, to, fmt.Errorf("%w: %s", rafttypes.ErrSlotDiverged, why))
+		}),
 	))
 	st.Node = node
 

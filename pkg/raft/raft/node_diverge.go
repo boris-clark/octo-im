@@ -83,6 +83,9 @@ func (n *Node) quarantine(state uint32, why string) {
 	// A quarantined leader steps down: it stops proposing, replicating and
 	// advancing commit, and its waiters are settled by the fence.
 	n.fenceProposals(wasLeader, term)
+	if n.opts.OnQuarantine != nil {
+		n.opts.OnQuarantine(state == divergeFailStopped, why)
+	}
 }
 
 // stepDiverged handles every event of a quarantined replica. It never

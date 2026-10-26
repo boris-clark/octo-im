@@ -239,3 +239,25 @@ func TestLearnerToFollowerStillAllowedWithRoleSwitchDisabled(t *testing.T) {
 	_, ok := findEvent(collectEvents(n), types.LearnerToFollowerReq)
 	require.True(t, ok)
 }
+
+// Diverge reasons are local storage results; one that arrives from a peer is
+// not acted on.
+func TestDivergeReasonFromPeerIgnored(t *testing.T) {
+	n := newTestNode(1, []uint64{1, 2, 3})
+	makeFollower(n, 2, 2)
+	n.Step(types.Event{Type: types.TruncateResp, From: 2, Term: 2, Reason: types.ReasonDiverged})
+	n.Step(types.Event{Type: types.StoreResp, From: 3, Term: 2, Reason: types.ReasonDivergedFailStop})
+	require.False(t, n.Diverged())
+}
+
+// The owner observes every quarantine transition.
+func TestOnQuarantineCallback(t *testing.T) {
+	var calls []bool
+	opts := NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithOnQuarantine(func(failStop bool, _ string) { calls = append(calls, failStop) }))
+	n := NewNode(0, types.RaftState{}, opts)
+	n.BecomeFollower(2, 2)
+	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
+	n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged})
+	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonDivergedFailStop})
+	require.Equal(t, []bool{false, true}, calls)
+}

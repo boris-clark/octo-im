@@ -289,11 +289,17 @@ func (s *Server) calculateSlotLeader(slotLogInfos map[uint64]map[uint32]SlotInfo
 // slotLogInfos 槽在各个副本上的日志信息
 // slotId 计算领导节点的槽Id
 func (s *Server) electionSlotLeaderBySlot(slotLogInfos map[uint64]map[uint32]SlotInfo, slotId uint32) uint64 {
+	return electSlotLeader(slotLogInfos, slotId, s.cfgServer.Slot(slotId))
+}
+
+// electSlotLeader picks the leader among the responders left after
+// collectSlotLogInfo. A diverged or unknown ExpectLeader has been dropped
+// there, so it is skipped here.
+func electSlotLeader(slotLogInfos map[uint64]map[uint32]SlotInfo, slotId uint32, st *types.Slot) uint64 {
 	var expectLeader uint64 // 期望领导
 	var lastLogIndex uint64 // 最新一条日志下标
 	var lastLogTerm uint32  // 最新一条日志任期
 	var leaderTerm uint32   // 领导任期
-	st := s.cfgServer.Slot(slotId)
 
 	// 如果槽正在进行领导者转移，则优先计算转移节点的日志信息
 	if st != nil && st.ExpectLeader != 0 && st.ExpectLeader != st.Leader {
