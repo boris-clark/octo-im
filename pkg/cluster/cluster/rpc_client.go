@@ -254,6 +254,9 @@ func (r *rpcClient) request(nodeId uint64, path string, body []byte) ([]byte, er
 	if resp.Status == proto.StatusOK {
 		return resp.Body, nil
 	}
+	if resp.Status == slotReplicaDiverged {
+		return nil, fmt.Errorf("%w: rpc %s refused by node %d: %s", rafttypes.ErrSlotDiverged, path, nodeId, resp.Body)
+	}
 
 	return nil, fmt.Errorf("rpc request failed, status: %d", resp.Status)
 

@@ -70,6 +70,11 @@ type Options struct {
 	// forwarded proposals. It must be unique per process lifetime of the owning
 	// node; zero disables forwarding (see forward_token.go).
 	ForwardIncarnation uint64
+
+	// LeaderRoleSwitchDisabled stops the leader from requesting
+	// FollowerToLeader or LearnerToLeader hand-offs and from pausing
+	// proposals for them. Leadership then changes only by election.
+	LeaderRoleSwitchDisabled bool
 }
 
 func NewOptions(opt ...Option) *Options {
@@ -233,4 +238,11 @@ func WithForwardIncarnation(incarnation uint64) Option {
 
 func WithSaveHardState(save func(types.HardState) error) Option {
 	return func(opts *Options) { opts.SaveHardState = save }
+}
+
+// WithLeaderRoleSwitchDisabled disables leader hand-off by role switch.
+func WithLeaderRoleSwitchDisabled(disabled bool) Option {
+	return func(o *Options) {
+		o.LeaderRoleSwitchDisabled = disabled
+	}
 }
