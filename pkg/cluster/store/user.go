@@ -75,7 +75,9 @@ func (s *Store) GetDevice(uid string, deviceFlag wkproto.DeviceFlag) (wkdb.Devic
 }
 
 func (s *Store) GetSystemUids() ([]string, error) {
-	return readOwned(s, globalSlot, s.wdb.GetSystemUids)
+	return readOwned(s, globalSlot, func() ([]string, error) {
+		return s.wdb.GetSystemUids()
+	})
 }
 
 func (s *Store) AddSystemUids(uids []string) error {

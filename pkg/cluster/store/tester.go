@@ -25,7 +25,9 @@ func (s *Store) GetTester(no string) (wkdb.Tester, error) {
 }
 
 func (s *Store) GetTesters() ([]wkdb.Tester, error) {
-	return readOwned(s, globalSlot, s.wdb.GetTesters)
+	return readOwned(s, globalSlot, func() ([]wkdb.Tester, error) {
+		return s.wdb.GetTesters()
+	})
 }
 
 func (s *Store) RemoveTester(no string) error {
