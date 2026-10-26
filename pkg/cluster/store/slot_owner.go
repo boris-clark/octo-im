@@ -27,11 +27,19 @@ import (
 // globalSlot holds cluster-global tables.
 const globalSlot uint32 = 0
 
+// A Store without a Slot (tests, tools) has no fence either; its reads stay
+// unfenced and the selectors are never used for proposals.
 func (s *Store) channelSlot(channelId string) uint32 {
+	if s.opts.Slot == nil {
+		return 0
+	}
 	return s.opts.Slot.GetSlotId(channelId)
 }
 
 func (s *Store) uidSlot(uid string) uint32 {
+	if s.opts.Slot == nil {
+		return 0
+	}
 	return s.opts.Slot.GetSlotId(uid)
 }
 
