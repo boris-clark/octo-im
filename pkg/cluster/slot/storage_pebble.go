@@ -275,7 +275,7 @@ func (p *PebbleShardLogStorage) validateAppend(shardNo string, logs []types.Log)
 			if exists && sameLogEntry(stored, lg) {
 				continue // replay of an applied entry: nothing to write
 			}
-			p.s.divergence.appendOverlapConflict.Add(1)
+			p.divergence().appendOverlapConflict.Add(1)
 			p.Error("refused conflicting append at or below the applied index",
 				zap.String("shardNo", shardNo),
 				zap.Uint64("index", lg.Index),
@@ -291,7 +291,7 @@ func (p *PebbleShardLogStorage) validateAppend(shardNo string, logs []types.Log)
 		// A different entry in the same term breaks Log Matching; it is only
 		// counted here and does not change the outcome.
 		if exists && stored.Term == lg.Term && !sameLogEntry(stored, lg) {
-			p.s.divergence.sameTermConflict.Add(1)
+			p.divergence().sameTermConflict.Add(1)
 			p.Warn("same-term log entry replaced above the applied index",
 				zap.String("shardNo", shardNo),
 				zap.Uint64("index", lg.Index),
@@ -361,7 +361,7 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 	if index < appliedIdx {
 		// Removing entries the state machine has applied would leave state
 		// that no log entry explains. Refuse without mutating anything.
-		p.s.divergence.truncateRefused.Add(1)
+		p.divergence().truncateRefused.Add(1)
 		p.Error("refused truncation below the applied index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
 		return fmt.Errorf("%w: slot %s index %d applied %d last %d", types.ErrTruncateBelowApplied, shardNo, index, appliedIdx, lastIndex)
 	}

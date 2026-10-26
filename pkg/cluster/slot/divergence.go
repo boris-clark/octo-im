@@ -119,6 +119,16 @@ func (d *divergence) snapshot() map[uint32]ReplicaState {
 	return out
 }
 
+// detachedDivergence serves storage opened without a Server (tools, tests).
+var detachedDivergence divergence
+
+func (p *PebbleShardLogStorage) divergence() *divergence {
+	if p.s == nil {
+		return &detachedDivergence
+	}
+	return &p.s.divergence
+}
+
 // DivergenceStats is a point-in-time copy of the divergence counters.
 type DivergenceStats struct {
 	TruncateRefused       int64
@@ -176,7 +186,9 @@ func (s *Server) quarantine(slotId uint32, to ReplicaState, cause error) {
 // for every other slot.
 func (p *PebbleShardLogStorage) MarkDiverged(shardNo string, cause error) error {
 	slotId := KeyToSlotId(shardNo)
-	p.s.quarantine(slotId, ReplicaQuarantined, cause)
+	if p.s != nil {
+		p.s.quarantine(slotId, ReplicaQuarantined, cause)
+	}
 
 	value := make([]byte, 10)
 	value[0] = divergedMarkerValueVersion
@@ -187,8 +199,10 @@ func (p *PebbleShardLogStorage) MarkDiverged(shardNo string, cause error) error 
 	}
 	err := p.setDivergedMarker(shardNo, value)
 	if err != nil {
-		p.s.divergence.persistFailed.Add(1)
-		p.s.quarantine(slotId, ReplicaFailStopped, err)
+		p.divergence().persistFailed.Add(1)
+		if p.s != nil {
+			p.s.quarantine(slotId, ReplicaFailStopped, err)
+		}
 		p.Error("slot_diverged_persist_failed: divergence marker not persisted; replica fail-stopped",
 			zap.String("shardNo", shardNo), zap.Error(err))
 		return fmt.Errorf("persist divergence marker for slot %s: %w", shardNo, err)
