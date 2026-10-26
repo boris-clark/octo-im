@@ -239,3 +239,37 @@ func TestSlotDivergedIsNotNotFound(t *testing.T) {
 	require.False(t, errors.Is(wkdb.ErrNotFound, rafttypes.ErrSlotDiverged))
 	require.False(t, errors.Is(rafttypes.ErrSlotDiverged, ErrChannelClusterConfigNotFound))
 }
+
+// D6: responses from concurrent requests are collected without a shared
+// append. Run with -race.
+func TestRequestSlotInfosConcurrentCollection(t *testing.T) {
+	s := testElectionServer(true)
+	s.opts.ConfigOptions = clusterconfig.NewOptions(clusterconfig.WithNodeId(1), clusterconfig.WithSlotMaxReplicaCount(3))
+	wait := map[uint64][]uint32{}
+	for id := uint64(2); id <= 64; id++ {
+		wait[id] = []uint32{1, 2}
+	}
+	fetch := func(nodeId uint64, req *SlotLogInfoReq) (*SlotLogInfoResp, error) {
+		if nodeId%7 == 0 {
+			return nil, errors.New("unreachable")
+		}
+		slots := make([]SlotInfo, 0, len(req.SlotIds))
+		for _, id := range req.SlotIds {
+			slots = append(slots, info(id, nodeId, 1, 1))
+		}
+		return &SlotLogInfoResp{NodeId: nodeId, Slots: slots}, nil
+	}
+	// wklog configures itself lazily on first use, which races on its own;
+	// configure it before the concurrent part.
+	s.Warn("warm up logger")
+	for i := 0; i < 20; i++ {
+		resps, err := s.requestSlotInfosWith(wait, fetch)
+		require.NoError(t, err)
+		require.Len(t, resps, 63-9, "every answering node exactly once")
+		seen := map[uint64]bool{}
+		for _, r := range resps {
+			require.False(t, seen[r.NodeId])
+			seen[r.NodeId] = true
+		}
+	}
+}

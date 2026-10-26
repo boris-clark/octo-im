@@ -7,6 +7,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTruncateBelowAppliedTypedAndCounted(t *testing.T) {
@@ -274,4 +275,13 @@ func TestScanDivergenceFailsOnMissingStorage(t *testing.T) {
 	if _, err := ScanDivergence(t.TempDir()+"/absent", 2, 4); err == nil {
 		t.Fatal("scan of a missing directory succeeded")
 	}
+}
+
+// Metric registration is idempotent and safe on the global meter.
+func TestRegisterDivergenceMetricsOnce(t *testing.T) {
+	s := &Server{opts: &Options{NodeId: 9}}
+	require.NotPanics(t, func() {
+		s.registerDivergenceMetrics()
+		s.registerDivergenceMetrics()
+	})
 }

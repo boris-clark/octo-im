@@ -128,6 +128,10 @@ func (s *Server) handleSlotElection(slots []*types.Slot) error {
 
 // 请求槽的日志高度
 func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*SlotLogInfoResp, error) {
+	return s.requestSlotInfosWith(waitElectionSlots, s.rpcClient.RequestSlotLastLogInfo)
+}
+
+func (s *Server) requestSlotInfosWith(waitElectionSlots map[uint64][]uint32, fetch func(uint64, *SlotLogInfoReq) (*SlotLogInfoResp, error)) ([]*SlotLogInfoResp, error) {
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*4)
 	defer cancel()
 	requestGroup, _ := errgroup.WithContext(timeoutCtx)
@@ -152,7 +156,7 @@ func (s *Server) requestSlotInfos(waitElectionSlots map[uint64][]uint32) ([]*Slo
 		}
 		requestGroup.Go(func(nID uint64, sids []uint32) func() error {
 			return func() error {
-				resp, err := s.rpcClient.RequestSlotLastLogInfo(nID, &SlotLogInfoReq{
+				resp, err := fetch(nID, &SlotLogInfoReq{
 					SlotIds: sids,
 				})
 				if err != nil {
