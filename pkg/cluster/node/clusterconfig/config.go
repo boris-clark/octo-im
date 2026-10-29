@@ -138,10 +138,17 @@ func (c *Config) nodes() []*types.Node {
 	return c.cfg.Nodes
 }
 
+// slots returns an isolated snapshot; apply workers retain ownership of cfg.
 func (c *Config) slots() []*types.Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cfg.Slots
+	slots := slices.Clone(c.cfg.Slots)
+	for i, slot := range slots {
+		if slot != nil {
+			slots[i] = slot.Clone()
+		}
+	}
+	return slots
 }
 
 // 判断是否有slot
