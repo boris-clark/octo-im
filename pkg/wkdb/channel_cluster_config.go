@@ -38,7 +38,7 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 		if !current.Equal(*expected) {
 			return nil
 		}
-		if expected.Term == ^uint32(0) || channelClusterConfig.Term != expected.Term+1 || channelClusterConfig.InstalledTerm != channelClusterConfig.Term || channelClusterConfig.LeaderId == 0 || !sameChannelVoters(current, channelClusterConfig) {
+		if channelClusterConfig.Term <= expected.Term || channelClusterConfig.InstalledTerm != channelClusterConfig.Term || channelClusterConfig.LeaderId == 0 || !sameChannelVoters(current, channelClusterConfig) {
 			return nil
 		}
 	} else if !IsEmptyChannelClusterConfig(current) {

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
@@ -32,6 +33,31 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			return 0, ErrConversationReadRetry
 		}
 		if before.Ready {
+			current, err := s.fencedChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+				return 0, err
+			}
+			if current.ConfVersion != cfg.ConfVersion {
+				return 0, raft.ErrConfigVersionStale
+			}
+			if cfg.Expected == nil && !wkdb.IsEmptyChannelClusterConfig(current) &&
+				(cfg.Term != current.Term || cfg.LeaderId != current.LeaderId) {
+				// Term/leader callbacks are proposals to the authority, not
+				// certificates. Fence the applied voters before publishing them.
+				if !slices.Equal(cfg.Replicas, current.Replicas) || !slices.Equal(cfg.Learners, current.Learners) ||
+					cfg.MigrateFrom != current.MigrateFrom || cfg.MigrateTo != current.MigrateTo || cfg.Term <= current.Term {
+					return 0, raft.ErrElectionNotInstalled
+				}
+				certified := current.Clone()
+				if _, err := s.fenceChannelConfig(ctx, &certified, cfg.Term); err != nil {
+					return 0, err
+				}
+				if certified.LeaderId != cfg.LeaderId {
+					return 0, ErrConversationReadRetry
+				}
+				cfg.Expected = &current
+				cfg.InstalledTerm, cfg.BoundaryTerm = certified.InstalledTerm, certified.BoundaryTerm
+			}
 			validate := func() error {
 				if s.cfgServer.SlotLeaderId(slotID) != s.opts.ConfigOptions.NodeId {
 					return ErrConversationReadRetry

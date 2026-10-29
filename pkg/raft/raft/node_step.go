@@ -756,7 +756,7 @@ func (n *Node) requestTruncate(index uint64) {
 	// A term-boundary reconciliation may name the tail already retained.
 	// No log is removed in that case. Continue the authenticated sync handshake
 	// without crossing a committed or legacy boundary or mutating durable state.
-	if index == n.queue.lastLogIndex && index >= max(n.queue.committedIndex, n.queue.appliedIndex) {
+	if index >= n.queue.lastLogIndex && index >= max(n.queue.committedIndex, n.queue.appliedIndex) {
 		n.sendSyncReq()
 		return
 	}

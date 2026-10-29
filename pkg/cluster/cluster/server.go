@@ -494,7 +494,19 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg rafttype.Config) error {
 	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
 	defer cancel()
-	channelCfg, err := s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
+	var channelCfg wkdb.ChannelClusterConfig
+	var err error
+	for {
+		channelCfg, err = s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
+		if !errors.Is(err, ErrConversationReadRetry) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
 		return err

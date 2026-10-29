@@ -29,6 +29,18 @@ type Channel struct {
 	configResumeIndex uint64
 }
 
+// Step treats a newer peer configuration as a reload hint. Only metadata read
+// from the slot authority may install the new leader; the peer event itself
+// remains subject to the node's persisted election fence.
+func (ch *Channel) Step(e types.Event) error {
+	if ch.s.opts.Cluster != nil && (e.Type == types.Ping || e.Type == types.NotifySync) &&
+		(e.ConfigVersion > ch.Config().Version || e.Term > ch.Config().Term || ch.PendingElectionFence()) {
+		id, typ := wkutil.ChannelFromlKey(ch.channelKey)
+		ch.s.wakeFollowerIfNeedAsync(id, typ)
+	}
+	return ch.Node.Step(e)
+}
+
 func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftGroup) (*Channel, error) {
 	channelKey := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
 	ch := &Channel{
@@ -149,7 +161,8 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 				// only wait here for recovery that this config actually admitted.
 				singleVoter := len(ch.Config().Replicas) == 1
 				appliedOnlyTail := ch.AppliedIndex() > ch.CommittedIndex() && ch.LastLogIndex() <= ch.AppliedIndex()
-				if singleVoter && ch.LastLogIndex() > ch.CommittedIndex() || appliedOnlyTail || ch.configResumeIndex > 0 {
+				oldTermTail := ch.LastLogIndex() > ch.CommittedIndex() && ch.LastLogTerm() < ch.Config().Term
+				if singleVoter && ch.LastLogIndex() > ch.CommittedIndex() || oldTermTail || appliedOnlyTail || ch.configResumeIndex > 0 {
 					index, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
 					if err != nil {
 						return err

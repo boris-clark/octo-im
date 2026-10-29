@@ -83,7 +83,7 @@ func (s *Server) requestElectionFences(ctx context.Context, cfg rt.Config, req e
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	req.Term = cfg.Term + 1
+	req.Term = max(req.Term, cfg.Term+1)
 	reports := make(map[uint64]rt.ElectionReport)
 	var mu sync.Mutex
 	var group errgroup.Group

@@ -292,7 +292,21 @@ func (r *rpcServer) handleChannelSwitchConfig(c *wkserver.Context) {
 		c.WriteErr(err)
 		return
 	}
-	err := r.s.channelServer.SwitchConfig(cfg.ChannelId, cfg.ChannelType, cfg)
+	// A callback snapshot is a hint, not installation authority. Reload through
+	// the slot's applied barrier before it can change a local runtime.
+	ctx, cancel := context.WithTimeout(r.s.cancelCtx, 5*time.Second)
+	defer cancel()
+	applied, err := r.s.loadConversationConfig(ctx, cfg.ChannelId, cfg.ChannelType)
+	// The legacy wire encoding omits the derived row id. Resolve that one
+	// storage key from the requested channel; all authority fields still match.
+	if cfg.Id == 0 {
+		cfg.Id = applied.Id
+	}
+	if err != nil || !applied.Equal(cfg) {
+		c.WriteErr(ErrConversationReadRetry)
+		return
+	}
+	err = r.s.channelServer.SwitchConfig(applied.ChannelId, applied.ChannelType, applied)
 	if err != nil {
 		r.Error("switch config failed", zap.Error(err), zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType))
 		c.WriteErr(err)

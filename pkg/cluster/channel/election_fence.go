@@ -13,7 +13,12 @@ func (s *Server) FenceElection(ctx context.Context, expected wkdb.ChannelCluster
 	key := wkutil.ChannelToKey(expected.ChannelId, expected.ChannelType)
 	// Dormant existing channels are reconstructed through the same owner reservation.
 	if s.getRaftGroup(key).GetRaft(key) == nil {
-		if err := s.createAndApplyConfig(ctx, expected); err != nil {
+		rg := s.getRaftGroup(key)
+		if _, err := rg.InitializeRaft(ctx, key, func() (raftgroup.IRaft, error) {
+			return createChannel(expected, s, rg)
+		}, func(r raftgroup.IRaft) error {
+			return r.(*Channel).Node.FenceElection(channelConfigToRaftConfig(s.opts.NodeId, expected), term)
+		}); err != nil {
 			return report, err
 		}
 	}

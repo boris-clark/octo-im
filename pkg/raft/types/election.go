@@ -38,7 +38,7 @@ func SelectFencedLeader(cfg Config, term uint32, reports map[uint64]ElectionRepo
 			floor = max(floor, report.Floor)
 		}
 	}
-	if term != cfg.Term+1 || len(valid) < len(voters)/2+1 {
+	if term <= cfg.Term || len(valid) < len(voters)/2+1 {
 		return 0, errors.New("durable applied-voter fence has no majority")
 	}
 	// A legacy history cannot be reconciled by maximum term/index alone.
@@ -46,7 +46,15 @@ func SelectFencedLeader(cfg Config, term uint32, reports map[uint64]ElectionRepo
 		if r, ok := valid[cfg.Leader]; ok && r.LastIndex >= floor {
 			return cfg.Leader, nil
 		}
-		return 0, errors.New("legacy leader of record is not a fenced reporter")
+		// A leaderless bootstrap with an empty fenced majority has no old
+		// quorum history to preserve. A nonempty report closes this exception.
+		emptyBootstrap := cfg.Leader == 0 && floor == 0
+		for _, r := range valid {
+			emptyBootstrap = emptyBootstrap && r.LastIndex == 0
+		}
+		if !emptyBootstrap {
+			return 0, errors.New("legacy leader of record is not a fenced reporter")
+		}
 	}
 	var leader uint64
 	var newest ElectionReport

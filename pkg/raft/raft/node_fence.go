@@ -29,6 +29,12 @@ func (n *Node) FenceElection(expect types.Config, term uint32) error {
 		}
 		n.queue.committedIndex = index
 	}
+	// A dormant replica has no volatile membership. The caller has reread the
+	// full applied authority; check its persisted identity before reconstructing
+	// a passive voter. Never briefly reactivate the old leader during recovery.
+	if len(n.cfg.Replicas) == 0 {
+		n.cfg = expect.Clone()
+	}
 	n.BecomeFollower(term, None)
 	n.cfg.FenceEnabled = true
 	n.cfg.Leader = None
@@ -89,8 +95,15 @@ func (n *Node) rejectUninstalledEvent(e types.Event) bool {
 }
 
 func (n *Node) matchesFenceExpected(expect types.Config, term uint32) bool {
+	if len(n.cfg.Replicas) == 0 && n.cfg.Version == 0 {
+		if n.PendingElectionFence() && n.safetyState.FenceIdentity != fenceIdentity(expect) {
+			return false
+		}
+		return expect.Term >= n.safetyState.InstalledTerm &&
+			(n.safetyState.InstalledTerm == 0 || expect.Term != n.safetyState.InstalledTerm || configIdentity(expect) == n.safetyState.InstalledIdentity)
+	}
 	current := n.cfg.Clone()
-	if n.safetyState.FenceTerm == term && n.safetyState.InstalledTerm < term {
+	if n.PendingElectionFence() && n.safetyState.FenceTerm <= term {
 		if n.safetyState.FenceIdentity != fenceIdentity(expect) {
 			return false
 		}
@@ -121,7 +134,7 @@ func (n *Node) PendingElectionFence() bool {
 // RestoreElectionFence restores only membership after a reread of applied state.
 // No leader is adopted and no election decision is replayed.
 func (n *Node) RestoreElectionFence(expected types.Config) error {
-	if n.Diverged() || !n.PendingElectionFence() || expected.Term == ^uint32(0) || expected.Term+1 != n.safetyState.FenceTerm || n.safetyState.FenceIdentity != fenceIdentity(expected) {
+	if n.Diverged() || !n.PendingElectionFence() || expected.Term >= n.safetyState.FenceTerm || n.safetyState.FenceIdentity != fenceIdentity(expected) {
 		return ErrElectionNotInstalled
 	}
 	n.BecomeFollower(n.safetyState.FenceTerm, None)
