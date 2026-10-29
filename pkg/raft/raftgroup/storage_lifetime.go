@@ -67,11 +67,7 @@ func (rg *RaftGroup) beginStorageOperation(r IRaft, request types.Event) *storag
 		return nil
 	}
 	lease.pending++
-	request.Logs = types.CloneLogs(request.Logs)
-	request.Config = request.Config.Clone()
-	if request.TermStartIndexInfo != nil {
-		request.TermStartIndexInfo = request.TermStartIndexInfo.Clone()
-	}
+	request = cloneStorageRequest(request)
 	op := &storageOperation{lease: lease, key: r.Key(), request: request, storage: lease.storage}
 	rg.storageOperations[op] = struct{}{}
 	return op
@@ -170,4 +166,13 @@ func (rg *RaftGroup) disposeStoppedStorage() {
 		op.disposed = true
 		rg.releaseStorageOperationLocked(op)
 	}
+}
+
+func cloneStorageRequest(e types.Event) types.Event {
+	e.Logs = types.CloneLogs(e.Logs)
+	e.Config = e.Config.Clone()
+	if e.TermStartIndexInfo != nil {
+		e.TermStartIndexInfo = e.TermStartIndexInfo.Clone()
+	}
+	return e
 }

@@ -167,3 +167,36 @@ func TestIssue87StorePoolRefusalCanRetry(t *testing.T) {
 	g.handleReceivedEvents()
 	require.EqualValues(t, 1, other.CommittedIndex())
 }
+
+func TestIssue87WorkerCopiesRequestBeforeSubmission(t *testing.T) {
+	gate := make(chan struct{})
+	storage := &memStorage{appendGate: gate}
+	g := New(NewOptions(WithStorage(storage), WithTransport(dropTransport{})))
+	n := issue87Node(admKey, 0, 0)
+	require.NoError(t, g.AddRaft(n))
+	defer func() { g.Stop(); require.NoError(t, g.WaitQuiescence(context.Background())); g.goPool.Release() }()
+	_, err := n.Admit([]types.Log{{Id: 100, Data: []byte("original")}})
+	require.NoError(t, err)
+	var req types.Event
+	for _, e := range n.Ready() {
+		if e.Type == types.StoreReq {
+			req = e
+		}
+	}
+	require.NotEmpty(t, req.Logs)
+	g.handleStoreReq(n, req)
+	req.Logs[0].Id = 200
+	req.Logs[0].Data[0] = 'x'
+	req.TermStartIndexInfo.Index = 99
+	close(gate)
+	waitFor(t, "immutable worker result", func() bool { effects, _ := issue87Pending(g); return effects == 0 })
+	g.handleReceivedEvents()
+	require.Equal(t, []uint64{100}, storage.storedIDs(), "a reused request mutated bytes accepted by the original worker")
+	logs, err := storage.GetLogs(admKey, 1, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []byte("original"), logs[0].Data)
+	row, err := storage.GetTermStartIndex(admKey, 1)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, row)
+	require.EqualValues(t, 1, n.CommittedIndex(), "the genuine unchanged request must complete")
+}

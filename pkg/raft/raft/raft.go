@@ -332,6 +332,11 @@ func (r *Raft) readyEvents() {
 }
 
 func (r *Raft) handleStoreReq(e types.Event) {
+	e.Logs = types.CloneLogs(e.Logs)
+	e.Config = e.Config.Clone()
+	if e.TermStartIndexInfo != nil {
+		e.TermStartIndexInfo = e.TermStartIndexInfo.Clone()
+	}
 
 	err := r.submitWorker(func() {
 		// 追加消息

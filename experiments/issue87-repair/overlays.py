@@ -34,5 +34,9 @@ s=(root/'pkg/raft/raft/node.go').read_text().replace('if termStartIndexInfo != n
 write('without-term-split',{'pkg/raft/raft/node.go':s})
 s=(root/'pkg/raft/raft/node.go').read_text().replace('n.pendingStoreTermStartIndex = termStartIndexInfo','n.pendingStoreTermStartIndex = termStartIndexInfo\n            if termStartIndexInfo != nil { n.updateLastTermStartIndex(termStartIndexInfo.Term,termStartIndexInfo.Index) }')
 write('without-durable-publication',{'pkg/raft/raft/node.go':s})
+s=(root/'pkg/raft/raftgroup/storage_lifetime.go').read_text()
+a=s.index('func cloneStorageRequest(')
+s=s[:a]+'func cloneStorageRequest(e types.Event) types.Event { return e }\n'
+write('without-worker-copy',{'pkg/raft/raftgroup/storage_lifetime.go':s})
 (out/'manifest.json').write_text(json.dumps({'base':base,'inputs':manifest},indent=2)+'\n')
 print(out)

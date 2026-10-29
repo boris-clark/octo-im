@@ -16,6 +16,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 	if op == nil {
 		return
 	}
+	e = cloneStorageRequest(op.request)
 	err := rg.submitStorageOperation(op, func() {
 		err := op.storage.AppendLogs(op.key, e.Logs, e.TermStartIndexInfo)
 		reason := types.ReasonOk
@@ -95,6 +96,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	if op == nil {
 		return
 	}
+	e = cloneStorageRequest(op.request)
 	err := rg.submitStorageOperation(op, func() {
 		// 获取裁断日志下标
 		var (
@@ -172,6 +174,7 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 	if op == nil {
 		return
 	}
+	e = cloneStorageRequest(op.request)
 	err := rg.submitStorageOperation(op, func() {
 		err := op.storage.TruncateLogTo(op.key, e.Index)
 		if err != nil {
@@ -222,6 +225,7 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 	if op == nil {
 		return
 	}
+	e = cloneStorageRequest(op.request)
 	err := rg.submitStorageOperation(op, func() {
 		// 已提交
 		// rg.wait.didCommit(op.key, e.EndIndex-1)
@@ -349,6 +353,7 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 	if op == nil {
 		return
 	}
+	e = cloneStorageRequest(op.request)
 	err := rg.submitStorageOperation(op, func() {
 
 		var (
