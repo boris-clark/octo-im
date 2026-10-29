@@ -136,6 +136,8 @@ func TestPinnedOldStoreAppliedTailRetryCommitApplyAndReopen(t *testing.T) {
 					require.EqualValues(t, c.Config.Term, logs[tail].Term)
 					m, e := db.LoadMsg(c.ID, c.Type, want)
 					require.NoError(t, e)
+					require.EqualValues(t, 190000+int(c.Type)*100+len(c.ID), m.MessageID)
+					require.EqualValues(t, want, m.MessageSeq)
 					require.Equal(t, []byte("after-applied-tail-retry"), m.Payload)
 					require.EqualValues(t, c.Config.Term, m.Term)
 					t.Logf("node=%d channel=%s term=%d retry=%d barrier=%d committed/applied=%d reopen=%v", i+1, key, c.Config.Term, old.MessageSeq, tail+1, want, reopen)

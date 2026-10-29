@@ -86,3 +86,33 @@ func TestRecoveryAppliedOnlySameTermTailRequiresFreshBarrier(t *testing.T) {
 	require.NoError(t, n.Step(types.Event{Type: types.ApplyResp, Reason: types.ReasonOk, Index: 5}))
 	require.EqualValues(t, 5, n.AppliedIndex())
 }
+
+func TestRecoveryEarlySyncCannotSkipAppliedTailBarrier(t *testing.T) {
+	var disk types.HardState
+	n := NewNode(1, types.RaftState{LastLogIndex: 4, LastTerm: 8, AppliedIndex: 4, HardState: types.HardState{Term: 8}}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithSaveHardState(func(s types.HardState) error {
+		disk = s
+		return nil
+	})))
+	n.BecomeLeader(8)
+	n.Ready()
+	// A follower can sync between owner initialization and config resume.
+	// Its legacy applied tail must not bypass a fresh recovery application.
+	require.NoError(t, n.Step(types.Event{Type: types.SyncReq, From: 2, To: 1, Term: 8, Index: 5, StoredIndex: 5, LastLogTerm: 8, Reason: types.ReasonOnlySync}))
+	require.Zero(t, n.CommittedIndex())
+	require.Zero(t, disk.CommittedFloor)
+	index, err := n.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
+	require.NoError(t, err)
+	require.EqualValues(t, 5, index)
+	req, ok := findEvent(n.Ready(), types.StoreReq)
+	require.True(t, ok)
+	require.NoError(t, n.Step(types.StoreResponse(req, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 5, Logs: req.Logs})))
+	require.Zero(t, n.CommittedIndex(), "the earlier acknowledgement covers only the legacy tail")
+	require.NoError(t, n.Step(types.Event{Type: types.SyncReq, From: 2, To: 1, Term: 8, Index: 6, StoredIndex: 6, LastLogTerm: 8, Reason: types.ReasonOnlySync}))
+	require.EqualValues(t, 5, disk.CommittedFloor)
+	require.EqualValues(t, 4, n.AppliedIndex())
+	apply, ok := findEvent(n.Ready(), types.ApplyReq)
+	require.True(t, ok)
+	require.EqualValues(t, 5, apply.StartIndex)
+	require.NoError(t, n.Step(types.Event{Type: types.ApplyResp, Reason: types.ReasonOk, Index: 5}))
+	require.EqualValues(t, 5, n.AppliedIndex())
+}

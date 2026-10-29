@@ -562,6 +562,12 @@ func (n *Node) updateLeaderCommittedIndex() bool {
 func (n *Node) committedIndexForLeader() uint64 {
 
 	committed := n.queue.committedIndex
+	// A legacy applied-only tail needs a fresh store beyond that progress.
+	// Sync can arrive before config resume admits its recovery entry; do not
+	// let that early acknowledgement skip the subsequent real apply gate.
+	if n.opts.SaveHardState != nil && n.queue.appliedIndex > committed && n.queue.storedIndex <= n.queue.appliedIndex {
+		return committed
+	}
 	quorum := n.quorum() // r.replicas 不包含本节点
 	if quorum <= 1 {     // 如果少于或等于一个节点，那么直接返回最后一条日志下标
 		if n.opts.SaveHardState != nil && n.LastLogTerm() != n.cfg.Term {
