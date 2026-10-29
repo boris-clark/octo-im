@@ -142,15 +142,19 @@ func (n *Node) sendPing(to uint64) {
 
 func (n *Node) sendStoreReq(logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) {
 	e := types.Event{
-		Type: types.StoreReq,
-		Term: n.cfg.Term,
-		To:   types.LocalNode,
-		Logs: logs,
+		Type:          types.StoreReq,
+		Config:        n.cfg.Clone(),
+		ConfigVersion: n.cfg.Version,
+		Term:          n.cfg.Term,
+		To:            types.LocalNode,
+		Logs:          logs,
 	}
 
 	if termStartIndexInfo != nil {
 		e.TermStartIndexInfo = termStartIndexInfo.Clone()
 	}
+	n.pendingStore, e = types.NewStoreOperation(e)
+	n.pendingStoreRevision = n.queue.storageRevision
 	n.events = append(n.events, e)
 }
 

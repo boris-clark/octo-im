@@ -42,8 +42,11 @@ type Node struct {
 	electionState          // 选举状态
 	syncState              // 同步状态
 	// 最新的任期对应的开始日志下标
-	lastTermStartIndex types.TermStartIndexInfo
-	onlySync           bool // 是否只同步,不做截断判断
+	lastTermStartIndex         types.TermStartIndexInfo
+	pendingStore               *types.StoreOperation
+	pendingStoreRevision       uint64
+	pendingStoreTermStartIndex *types.TermStartIndexInfo
+	onlySync                   bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
 	truncating  bool // 截断中
@@ -193,19 +196,34 @@ func (n *Node) Ready() []types.Event {
 	}
 
 	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {
-		logs := n.queue.nextStoreLogs(0)
-		if len(logs) > 0 {
-			var termStartIndexInfo *types.TermStartIndexInfo
-			for _, log := range logs {
-				if n.lastTermStartIndex.Term != log.Term || log.Index == 1 {
-					termStartIndexInfo = &types.TermStartIndexInfo{
-						Term:  log.Term,
-						Index: log.Index,
-					}
-					n.updateLastTermStartIndex(log.Term, log.Index)
+		logs := n.queue.nextStoreLogs(int(n.opts.MaxLogCountPerBatch))
+		if limit := n.opts.MaxStoreBatchBytes; limit > 0 {
+			var size uint64
+			for i := range logs {
+				entrySize := uint64(logs[i].LogSize())
+				if i > 0 && (size >= limit || entrySize > limit-size) {
+					logs = logs[:i]
 					break
 				}
+				size += entrySize
 			}
+		}
+		if len(logs) > 0 {
+			// The storage contract carries one term row per atomic append.
+			// Split before a second transition; publish only a durable prefix.
+			var termStartIndexInfo *types.TermStartIndexInfo
+			lastTerm := n.lastTermStartIndex.Term
+			for i, log := range logs {
+				if lastTerm != log.Term || log.Index == 1 {
+					if termStartIndexInfo != nil {
+						logs = logs[:i]
+						break
+					}
+					termStartIndexInfo = &types.TermStartIndexInfo{Term: log.Term, Index: log.Index}
+					lastTerm = log.Term
+				}
+			}
+			n.pendingStoreTermStartIndex = termStartIndexInfo
 			n.sendStoreReq(logs, termStartIndexInfo)
 		}
 	}

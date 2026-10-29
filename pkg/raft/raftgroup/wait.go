@@ -16,6 +16,7 @@ import (
 // submitted Id and Data for every index in [first, last]; each applied entry
 // in the range is checked against it.
 type receipt struct {
+	lease   *raftLease
 	raftKey string
 	seq     uint64
 	term    uint32

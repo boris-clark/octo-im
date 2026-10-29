@@ -38,6 +38,9 @@ type Options struct {
 	Advance func()
 	// MaxLogCountPerBatch 每次同步的最大日志数量
 	MaxLogCountPerBatch uint64
+	// MaxStoreBatchBytes bounds local append batches. One oversized entry is
+	// allowed alone so an accepted entry can always make storage progress.
+	MaxStoreBatchBytes uint64
 
 	// GoPoolSize 协程池大小, 如果设置了Submit, 那么这个参数无效
 	GoPoolSize int
@@ -90,6 +93,7 @@ func NewOptions(opt ...Option) *Options {
 		ElectionInterval:           10,
 		TickInterval:               time.Millisecond * 150,
 		MaxLogCountPerBatch:        1000,
+		MaxStoreBatchBytes:         10 * 1024 * 1024,
 		GoPoolSize:                 1000,
 		ProposeTimeout:             time.Second * 5,
 		LearnerToFollowerMinLogGap: 100,
@@ -242,6 +246,10 @@ func WithForwardIncarnation(incarnation uint64) Option {
 
 func WithSaveHardState(save func(types.HardState) error) Option {
 	return func(opts *Options) { opts.SaveHardState = save }
+}
+
+func WithMaxStoreBatchBytes(size uint64) Option {
+	return func(o *Options) { o.MaxStoreBatchBytes = size }
 }
 
 // WithOnQuarantine observes quarantine transitions of the replica.

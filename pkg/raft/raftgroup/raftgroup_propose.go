@@ -102,6 +102,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	}
 
 	raft.KeepAlive()
+	lease := rg.raftStorageLease(raft)
 
 	if !raft.IsLeader() {
 		// 如果不是leader，则转发给leader
@@ -112,6 +113,7 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 		}
 		var appliedBefore bool
 		waiter, appliedBefore = rg.wait.register(receipt{
+			lease:     lease,
 			raftKey:   raftKey,
 			seq:       rg.proposalSeq.Add(1),
 			first:     resps[0].Index,
@@ -119,6 +121,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 			logs:      newReceiptLogs(reqs, resps[0].Index),
 			forwarded: true,
 		})
+		if !rg.isCurrentStorageLease(lease, raftKey) {
+			rg.wait.complete(waiter, proposalOutcomeUnknown(ErrRaftNotExist))
+		}
 		// The entry may have been applied before the waiter existed. An
 		// applied index alone does not prove it is this entry, so read it.
 		if appliedBefore {
@@ -275,6 +280,7 @@ func (rg *RaftGroup) admitProposal(raft IRaft, e Event) {
 			submitted[i] = types.Log{Id: l.Id, Index: adm.FirstIndex + uint64(i), Data: l.Data}
 		}
 		waiter, _ = rg.wait.register(receipt{
+			lease:   rg.raftStorageLease(raft),
 			raftKey: raft.Key(),
 			seq:     p.seq,
 			term:    adm.Term,

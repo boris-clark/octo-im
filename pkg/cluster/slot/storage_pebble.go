@@ -34,6 +34,9 @@ type PebbleShardLogStorage struct {
 	// slotLocks serializes operations for the same raft slot without coupling
 	// unrelated slots that happen to share one physical Pebble DB shard.
 	slotLocks sync.Map // map[string]*sync.Mutex
+	// appendCommitHook observes the actual durable append boundary in storage
+	// barrier tests. It is installed before storage is used and otherwise nil.
+	appendCommitHook func(committed bool)
 }
 
 func NewPebbleShardLogStorage(s *Server, path string, shardNum uint32) *PebbleShardLogStorage {
@@ -240,7 +243,14 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 		batch.Set(keyData, logData)
 	}
 
-	return batch.CommitWait()
+	if p.appendCommitHook != nil {
+		p.appendCommitHook(false)
+	}
+	err = batch.CommitWait()
+	if err == nil && p.appendCommitHook != nil {
+		p.appendCommitHook(true)
+	}
+	return err
 }
 
 // validateAppend returns the logs that must be written. It must be called

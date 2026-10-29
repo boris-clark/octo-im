@@ -7,7 +7,6 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
-	"go.uber.org/zap"
 )
 
 type Slot struct {
@@ -17,7 +16,7 @@ type Slot struct {
 	wklog.Log
 }
 
-func newSlot(slot *types.Slot, s *Server) *Slot {
+func newSlot(slot *types.Slot, s *Server) (*Slot, error) {
 	shardNo := SlotIdToKey(slot.Id)
 	st := &Slot{
 		slot:    slot.Clone(),
@@ -26,11 +25,11 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	}
 	state, err := s.storage.GetState(shardNo)
 	if err != nil {
-		st.Panic("get state failed", zap.Error(err))
+		return nil, fmt.Errorf("get slot state: %w", err)
 	}
 	lastLogIndex, err := s.storage.GetTermStartIndex(shardNo, state.LastTerm)
 	if err != nil {
-		st.Panic("get last term failed", zap.Error(err))
+		return nil, fmt.Errorf("get slot term: %w", err)
 	}
 	if state.Diverged {
 		// The fence is in place before the raft exists, so no read or
@@ -57,7 +56,7 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	))
 	st.Node = node
 
-	return st
+	return st, nil
 }
 
 // needUpdate 判断是否需要更新

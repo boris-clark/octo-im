@@ -202,6 +202,9 @@ const (
 )
 
 type Event struct {
+	// storeOperation and storeResult exist only on the local storage route.
+	storeOperation *StoreOperation
+	storeResult    *storeResult
 	// Type 事件类型
 	Type EventType
 	// From 事件发起者
@@ -356,8 +359,9 @@ func (e Event) Marshal() ([]byte, error) {
 }
 
 func (e *Event) Unmarshal(data []byte) error {
-	// Provenance is local only; a decoded event never carries a verdict.
-	e.storageVerdict = StorageVerdictNone
+	// Clear absent wire fields as well as every local capability on reuse,
+	// including when decoding subsequently fails.
+	*e = Event{}
 	dec := wkproto.NewDecoder(data)
 	flag, err := dec.Uint32()
 	if err != nil {

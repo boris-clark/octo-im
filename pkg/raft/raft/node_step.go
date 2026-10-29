@@ -7,6 +7,20 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	if e.Type == types.StoreResp {
+		if !n.consumeStoreResponse(e) {
+			return nil
+		}
+	}
+	// An accepted append owns its original range through completion. A peer
+	// retries overlapping sync data once that append has a terminal disposition.
+	if e.Type == types.SyncResp && len(e.Logs) > 0 && n.pendingStore != nil {
+		req := n.pendingStore.Request()
+		if e.Logs[0].Index <= req.Logs[len(req.Logs)-1].Index {
+			return nil
+		}
+	}
+
 	// Storage refused a truncation or an append that would have left the
 	// applied state inconsistent with the log. Quarantine before anything
 	// else can act on the in-memory log.
@@ -519,6 +533,7 @@ func (n *Node) updateSyncInfo(e types.Event) {
 	syncInfo.SyncTick = 0
 	syncInfo.LastSyncIndex = e.Index
 	syncInfo.StoredIndex = e.StoredIndex
+	syncInfo.LastLogTerm = e.LastLogTerm
 }
 
 // 更新领导的提交索引
@@ -546,7 +561,7 @@ func (n *Node) committedIndexForLeader() uint64 {
 	getMaxLogIndexLessThanParam := func(maxIndex uint64) uint64 {
 		secondMaxIndex := uint64(0)
 		for id, syncInfo := range n.replicaSync {
-			if id == n.opts.NodeId || !n.isVoter(id) {
+			if id == n.opts.NodeId || !n.isVoter(id) || syncInfo.LastLogTerm != n.cfg.Term {
 				continue
 			}
 			if syncInfo.StoredIndex < maxIndex || maxIndex == 0 {
@@ -576,7 +591,7 @@ func (n *Node) committedIndexForLeader() uint64 {
 			continue
 		}
 		for id, syncInfo := range n.replicaSync {
-			if id == n.opts.NodeId || !n.isVoter(id) {
+			if id == n.opts.NodeId || !n.isVoter(id) || syncInfo.LastLogTerm != n.cfg.Term {
 				continue
 			}
 			if syncInfo.StoredIndex >= maxLogIndex+1 {

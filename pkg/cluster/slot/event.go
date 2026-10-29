@@ -1,9 +1,14 @@
 package slot
 
 import (
+	"context"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"go.uber.org/zap"
 )
 
 // 配置发送改变
@@ -39,13 +44,16 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 	}
 
 	if rft == nil { // 添加slot的raft
-		slotNode := newSlot(slot, s)
-		s.raftGroup.AddRaft(slotNode)
-
-		s.raftGroup.AddEvent(shardNo, rafttype.Event{
-			Type:   rafttype.ConfChange,
-			Config: s.slotToConfig(slot),
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := s.raftGroup.InitializeRaft(ctx, shardNo, func() (raftgroup.IRaft, error) {
+			return newSlot(slot, s)
+		}, func(candidate raftgroup.IRaft) error {
+			return candidate.Step(rafttype.Event{Type: rafttype.ConfChange, Config: s.slotToConfig(slot)})
 		})
+		if err != nil {
+			s.Error("initialize slot failed", zap.Uint32("slotId", slot.Id), zap.Error(err))
+		}
 	} else { // 更新slot的分布式配置
 		raftSlot := rft.(*Slot)
 		if raftSlot.needUpdate(slot) {

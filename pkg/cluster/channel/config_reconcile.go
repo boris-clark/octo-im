@@ -42,25 +42,18 @@ func (s *Server) ReconcileConfig(ctx context.Context, cfg wkdb.ChannelClusterCon
 func (s *Server) createAndApplyConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
 	key := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
 	rg := s.getRaftGroup(key)
-	ch, err := createChannel(cfg, s, rg)
-	if err != nil {
-		return err
-	}
 	raftCfg := channelConfigToRaftConfig(s.opts.NodeId, cfg).Clone()
-	err = rg.Do(ctx, key, func(existing raftgroup.IRaft) error {
-		if existing != nil {
-			ch = existing.(*Channel)
-		}
-		if err := ch.applyConfigOnOwner(raftCfg); err != nil {
-			return err
-		}
-		if existing == nil {
-			rg.AddRaft(ch)
-		}
-		return nil
+	if existing := rg.GetRaft(key); existing != nil {
+		return existing.(*Channel).applyConfig(ctx, raftCfg)
+	}
+	r, err := rg.InitializeRaft(ctx, key, func() (raftgroup.IRaft, error) {
+		return createChannel(cfg, s, rg)
+	}, func(candidate raftgroup.IRaft) error {
+		return candidate.(*Channel).applyConfigOnOwner(raftCfg)
 	})
 	if err != nil {
 		return err
 	}
+	ch := r.(*Channel)
 	return ch.resumeConfig(ctx)
 }

@@ -343,20 +343,20 @@ func (r *Raft) handleStoreReq(e types.Event) {
 		if err != nil {
 			reason = types.ReasonError
 		}
-		r.enqueue(types.Event{
+		r.enqueue(types.StoreResponse(e, types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
 			Reason: reason,
-		})
+		}))
 	})
 
 	if err != nil {
 		r.Error("submit append logs failed", zap.Error(err))
-		r.enqueue(types.Event{
+		r.enqueue(types.StoreResponse(e, types.Event{
 			Type:   types.StoreResp,
 			Reason: types.ReasonError,
-		})
+		}))
 	}
 
 }

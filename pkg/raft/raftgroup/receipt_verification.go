@@ -76,7 +76,18 @@ func (rg *RaftGroup) WaitQuiescence(ctx context.Context) error {
 // tasks are additionally counted for receipt cleanup assertions.
 func (rg *RaftGroup) verifyReceiptAsync(w *receiptWaiter) {
 	rg.verificationWorkers.Add(1)
-	err := rg.submit(func() {
+	op := rg.beginReceiptVerification(w)
+	if op == nil {
+		rg.verificationWorkers.Add(-1)
+		cause := ErrRaftNotExist
+		if rg.stopBegun.Load() {
+			cause = ErrGroupStopped
+		}
+		rg.wait.complete(w, proposalOutcomeUnknown(cause))
+		return
+	}
+	err := rg.submitStorageOperation(op, func() {
+		defer rg.disposeStorageOperation(op)
 		defer rg.verificationWorkers.Add(-1)
 		rg.verificationMu.Lock()
 		stopped := rg.verificationStopped
@@ -88,6 +99,7 @@ func (rg *RaftGroup) verifyReceiptAsync(w *receiptWaiter) {
 		rg.wait.readReceipt(w)
 	})
 	if err != nil {
+		rg.disposeStorageOperation(op)
 		rg.verificationWorkers.Add(-1)
 		rg.wait.complete(w, proposalOutcomeUnknown(err))
 	}

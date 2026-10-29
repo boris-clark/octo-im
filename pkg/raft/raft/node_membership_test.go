@@ -130,11 +130,11 @@ func TestMembershipCommitQuorumExcludesNonVoters(t *testing.T) {
 	n.cfg.Learners = []uint64{4}
 	n.queue.lastLogIndex = 10
 	n.queue.storedIndex = 10
-	n.replicaSync[1] = &SyncInfo{StoredIndex: 11} // self must not be counted twice
-	n.replicaSync[4] = &SyncInfo{StoredIndex: 11}
-	n.replicaSync[99] = &SyncInfo{StoredIndex: 11}
+	n.replicaSync[1] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 11} // self must not be counted twice
+	n.replicaSync[4] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 11}
+	n.replicaSync[99] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 11}
 	require.Zero(t, n.committedIndexForLeader())
-	n.replicaSync[2] = &SyncInfo{StoredIndex: 11}
+	n.replicaSync[2] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 11}
 	require.Equal(t, uint64(10), n.committedIndexForLeader())
 }
 
