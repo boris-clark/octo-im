@@ -33,6 +33,7 @@ func (h *Handler) onSend(ctx *eventbus.UserContext) {
 }
 
 func (h *Handler) handleOnSend(event *eventbus.Event) {
+	currentTrace := trace.GetGlobalTrace()
 
 	// 记录消息路径
 	event.Track.Record(track.PositionUserOnSend)
@@ -126,8 +127,8 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		return
 	}
 
-	trace.GlobalTrace.Metrics.App().SendPacketCountAdd(1)
-	trace.GlobalTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
+	currentTrace.Metrics.App().SendPacketCountAdd(1)
+	currentTrace.Metrics.App().SendPacketBytesAdd(sendPacket.GetFrameSize())
 	// 添加消息到频道
 	eventbus.Channel.SendMessage(fakeChannelId, channelType, &eventbus.Event{
 		Type:            eventbus.EventChannelOnSend,

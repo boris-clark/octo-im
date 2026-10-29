@@ -46,10 +46,12 @@ func (s *Server) ProposeUntilApplied(slotId uint32, data []byte) (*types.Propose
 
 	start := time.Now()
 	defer func() {
-		if trace.GlobalTrace != nil {
-			trace.GlobalTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindSlot, time.Since(start).Milliseconds())
+		currentTrace := trace.GetGlobalTrace()
+
+		if currentTrace != nil {
+			currentTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindSlot, time.Since(start).Milliseconds())
 			if err := recover(); err != nil {
-				trace.GlobalTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindSlot, 1)
+				currentTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindSlot, 1)
 			}
 		}
 	}()
@@ -66,10 +68,12 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, slotId uint32, 
 
 	start := time.Now()
 	defer func() {
-		if trace.GlobalTrace != nil {
-			trace.GlobalTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindSlot, time.Since(start).Milliseconds())
+		currentTrace := trace.GetGlobalTrace()
+
+		if currentTrace != nil {
+			currentTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindSlot, time.Since(start).Milliseconds())
 			if err := recover(); err != nil {
-				trace.GlobalTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindSlot, 1)
+				currentTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindSlot, 1)
 			}
 		}
 	}()

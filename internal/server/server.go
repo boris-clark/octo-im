@@ -146,10 +146,14 @@ func New(opts *options.Options) *Server {
 		wknet.WithWSSAddr(s.opts.WSSAddr),
 		wknet.WithWSTLSConfig(s.opts.WSTLSConfig),
 		wknet.WithOnReadBytes(func(n int) {
-			trace.GlobalTrace.Metrics.System().ExtranetIncomingAdd(int64(n))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().ExtranetIncomingAdd(int64(n))
 		}),
 		wknet.WithOnWirteBytes(func(n int) {
-			trace.GlobalTrace.Metrics.System().ExtranetOutgoingAdd(int64(n))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().ExtranetOutgoingAdd(int64(n))
 		}),
 	)
 

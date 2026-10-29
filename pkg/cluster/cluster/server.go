@@ -119,10 +119,14 @@ func New(opts *Options) *Server {
 		opts.Addr,
 		wkserver.WithMessagePoolOn(false),
 		wkserver.WithOnRequest(func(conn gnet.Conn, req *proto.Request) {
-			trace.GlobalTrace.Metrics.System().IntranetIncomingAdd(int64(len(req.Body)))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().IntranetIncomingAdd(int64(len(req.Body)))
 		}),
 		wkserver.WithOnResponse(func(conn gnet.Conn, resp *proto.Response) {
-			trace.GlobalTrace.Metrics.System().IntranetOutgoingAdd(int64(len(resp.Body)))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().IntranetOutgoingAdd(int64(len(resp.Body)))
 		}),
 	)
 	s.netServer.OnMessage(s.onMessage)

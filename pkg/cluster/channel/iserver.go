@@ -15,10 +15,12 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, channelId 
 
 	start := time.Now()
 	defer func() {
-		if trace.GlobalTrace != nil {
-			trace.GlobalTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindChannel, time.Since(start).Milliseconds())
+		currentTrace := trace.GetGlobalTrace()
+
+		if currentTrace != nil {
+			currentTrace.Metrics.Cluster().ProposeLatencyAdd(trace.ClusterKindChannel, time.Since(start).Milliseconds())
 			if err := recover(); err != nil {
-				trace.GlobalTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindChannel, 1)
+				currentTrace.Metrics.Cluster().ProposeFailedCountAdd(trace.ClusterKindChannel, 1)
 			}
 		}
 	}()

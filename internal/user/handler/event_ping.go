@@ -7,12 +7,14 @@ import (
 )
 
 func (h *Handler) ping(event *eventbus.Event) {
+	currentTrace := trace.GetGlobalTrace()
+
 	conn := event.Conn
 
-	trace.GlobalTrace.Metrics.App().PingCountAdd(1)
-	trace.GlobalTrace.Metrics.App().PingBytesAdd(1) // ping的大小就是1
+	currentTrace.Metrics.App().PingCountAdd(1)
+	currentTrace.Metrics.App().PingBytesAdd(1) // ping的大小就是1
 
-	trace.GlobalTrace.Metrics.App().PongCountAdd(1)
-	trace.GlobalTrace.Metrics.App().PongBytesAdd(1)
+	currentTrace.Metrics.App().PongCountAdd(1)
+	currentTrace.Metrics.App().PongBytesAdd(1)
 	eventbus.User.ConnWrite(event.ReqId, conn, &wkproto.PongPacket{})
 }
