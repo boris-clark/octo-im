@@ -4,6 +4,7 @@ import "errors"
 
 // ElectionReport is returned only after the voter has durably stopped the old term.
 type ElectionReport struct {
+	Identity     [32]byte
 	NodeID       uint64
 	Term         uint32
 	LastIndex    uint64

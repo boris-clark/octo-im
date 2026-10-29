@@ -13,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 const channelConfigTransitionPath = "/rpc/channel/configTransition/v1"
@@ -66,6 +67,11 @@ func (s *Server) saveChannelConfigTransition(ctx context.Context, id string, typ
 }
 
 func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string, typ uint8, next rafttype.Config) (wkdb.ChannelClusterConfig, error) {
+	key := wkutil.ChannelToKey(id, typ)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
+	defer s.channelInstallLock.Unlock(key)
 	current, err := s.loadConversationConfigLocal(ctx, id, typ)
 	if err != nil {
 		return current, err
@@ -73,7 +79,7 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if next.Version != current.ConfVersion || next.Term < current.Term {
 		return current, raft.ErrConfigVersionStale
 	}
-	if next.Term > current.Term && next.Leader == current.LeaderId &&
+	if next.Term > current.Term && slices.Contains(current.Replicas, next.Leader) && !slices.Contains(current.Learners, next.Leader) &&
 		slices.Equal(next.Replicas, current.Replicas) && slices.Equal(next.Learners, current.Learners) &&
 		next.MigrateFrom == current.MigrateFrom && next.MigrateTo == current.MigrateTo {
 		// Recovery asks for a fresh term, not preferential treatment for the
@@ -87,7 +93,7 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if !validConversationConfig(current, id, typ) {
 		return current, ErrConversationReadRetry
 	}
-	_, err = s.saveChannelConfig(ctx, current)
+	_, err = s.saveChannelConfigLocked(ctx, current)
 	if err != nil {
 		return current, err
 	}

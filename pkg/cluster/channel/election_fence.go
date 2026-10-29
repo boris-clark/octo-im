@@ -24,6 +24,14 @@ func (s *Server) FenceElection(ctx context.Context, expected wkdb.ChannelCluster
 	}
 	err := s.getRaftGroup(key).Do(ctx, key, func(r raftgroup.IRaft) error {
 		ch := r.(*Channel)
+		// The caller has compared the complete applied authority. A version-only
+		// metadata update can precede its runtime hint; adopt that version before
+		// fencing, while never reactivating an already pending old-term fence.
+		if !ch.PendingElectionFence() && ch.Config().Version < expected.ConfVersion {
+			if err := ch.applyConfigOnOwner(channelConfigToRaftConfig(s.opts.NodeId, expected)); err != nil {
+				return err
+			}
+		}
 		if err := ch.Node.FenceElection(channelConfigToRaftConfig(s.opts.NodeId, expected), term); err != nil {
 			return err
 		}
@@ -31,7 +39,7 @@ func (s *Server) FenceElection(ctx context.Context, expected wkdb.ChannelCluster
 		if err != nil {
 			return err
 		}
-		report = types.ElectionReport{NodeID: s.opts.NodeId, Term: term, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor, BoundaryTerm: state.HardState.BoundaryTerm, Fenced: state.HardState.FenceTerm == term && state.HardState.InstalledTerm < term && !state.Diverged}
+		report = types.ElectionReport{Identity: types.ElectionIdentity(channelConfigToRaftConfig(s.opts.NodeId, expected)), NodeID: s.opts.NodeId, Term: term, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor, BoundaryTerm: state.HardState.BoundaryTerm, Fenced: state.HardState.FenceTerm == term && state.HardState.InstalledTerm < term && !state.Diverged}
 		return nil
 	})
 	return report, err

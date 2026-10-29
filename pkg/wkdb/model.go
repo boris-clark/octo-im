@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	rt "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 )
 
@@ -607,12 +608,15 @@ type ChannelClusterConfig struct {
 	CreatedAt       *time.Time            `json:"created_at,omitempty"`        // 创建时间
 	UpdatedAt       *time.Time            `json:"updated_at,omitempty"`        // 更新时间
 
+	// Membership is validated at slot apply and is never retained as authority.
+	Membership *rt.MembershipCertificate `json:"membership,omitempty"`
+
 	version uint16 // 数据协议版本
 }
 
 func (c *ChannelClusterConfig) Clone() ChannelClusterConfig {
 	return ChannelClusterConfig{
-		InstalledTerm: c.InstalledTerm, BoundaryTerm: c.BoundaryTerm, Expected: c.Expected,
+		InstalledTerm: c.InstalledTerm, BoundaryTerm: c.BoundaryTerm, Expected: c.Expected, Membership: c.Membership,
 		Id:              c.Id,
 		ChannelId:       c.ChannelId,
 		ChannelType:     c.ChannelType,

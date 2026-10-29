@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	rt "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/cockroachdb/pebble"
 	"go.uber.org/zap"
@@ -38,7 +39,7 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 		if !current.Equal(*expected) {
 			return nil
 		}
-		if channelClusterConfig.Term <= expected.Term || channelClusterConfig.InstalledTerm != channelClusterConfig.Term || channelClusterConfig.LeaderId == 0 || !sameChannelVoters(current, channelClusterConfig) {
+		if channelClusterConfig.ConfVersion <= expected.ConfVersion || channelClusterConfig.Term <= expected.Term || channelClusterConfig.InstalledTerm != channelClusterConfig.Term || channelClusterConfig.LeaderId == 0 || (!sameChannelVoters(current, channelClusterConfig) && !certifiedChannelMembership(current, channelClusterConfig)) {
 			return nil
 		}
 	} else if !IsEmptyChannelClusterConfig(current) {
@@ -54,6 +55,7 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 	}
 
 	channelClusterConfig.Expected = nil
+	channelClusterConfig.Membership = nil
 	primaryKey := key.ChannelToNum(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 
 	// oldChannelClusterConfig, err := wk.getChannelClusterConfigById(primaryKey)
@@ -645,4 +647,13 @@ func (wk *wukongDB) iteratorChannelClusterConfig(iter *pebble.Iterator, iterFnc 
 
 func sameChannelVoters(a, b ChannelClusterConfig) bool {
 	return slices.Equal(a.Replicas, b.Replicas) && slices.Equal(a.Learners, b.Learners) && a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo
+}
+
+// Membership changes keep the same expected-identity CAS as elections, and
+// additionally prove both the stopped old quorum and the stored new quorum.
+func certifiedChannelMembership(old, next ChannelClusterConfig) bool {
+	toRaft := func(c ChannelClusterConfig) rt.Config {
+		return rt.Config{Replicas: c.Replicas, Learners: c.Learners, Leader: c.LeaderId, Term: c.Term, Version: c.ConfVersion, MigrateFrom: c.MigrateFrom, MigrateTo: c.MigrateTo, InstalledTerm: c.InstalledTerm, BoundaryTerm: c.BoundaryTerm}
+	}
+	return rt.ValidateMembershipInstall(toRaft(old), toRaft(next), next.Membership) == nil
 }

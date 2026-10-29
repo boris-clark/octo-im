@@ -78,6 +78,11 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 // only after election succeeds, then use the same version-fenced write as role
 // callbacks. A competing writer or ownership change makes this attempt retry.
 func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.ChannelClusterConfig) (wkdb.ChannelClusterConfig, error) {
+	key := wkutil.ChannelToKey(current.ChannelId, current.ChannelType)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
+	defer s.channelInstallLock.Unlock(key)
 	if err := ctx.Err(); err != nil {
 		return current, err
 	}
@@ -96,7 +101,7 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 	if !leaderChanged && !membersChanged {
 		return current, nil
 	}
-	_, err = s.saveChannelConfig(ctx, cfg)
+	_, err = s.saveChannelConfigLocked(ctx, cfg)
 	if err != nil {
 		return current, err
 	}

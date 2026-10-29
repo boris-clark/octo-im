@@ -20,6 +20,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/ringlock"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -68,18 +69,21 @@ type Server struct {
 	stopper       *syncutil.Stopper
 
 	channelKeyLock *keylock.KeyLock // 频道锁
+	// channelInstallLock serializes local fence-to-publication decisions only.
+	channelInstallLock *ringlock.RingLock
 
 	sync.Mutex
 }
 
 func New(opts *Options) *Server {
 	s := &Server{
-		opts:           opts,
-		nodeManager:    newNodeManager(opts),
-		Log:            wklog.NewWKLog("cluster"),
-		channelKeyLock: keylock.NewKeyLock(),
-		uptime:         time.Now(),
-		stopper:        syncutil.NewStopper(),
+		opts:               opts,
+		nodeManager:        newNodeManager(opts),
+		Log:                wklog.NewWKLog("cluster"),
+		channelKeyLock:     keylock.NewKeyLock(),
+		channelInstallLock: ringlock.NewRingLock(1024),
+		uptime:             time.Now(),
+		stopper:            syncutil.NewStopper(),
 	}
 	s.cancelCtx, s.cancelFnc = context.WithCancel(context.Background())
 	// 初始化传输层
@@ -186,24 +190,23 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	// Storage and slot owners must exist before config callbacks, and config
+	// Raft must exist before either the TCP ingress or event reader can use it.
+	err = s.slotServer.Start()
+	if err != nil {
+		return err
+	}
+	err = s.cfgServer.Start()
+	if err != nil {
+		return err
+	}
 	s.rpcServer.setRoutes()
-
 	err = s.netServer.Start()
 	if err != nil {
 		return err
 	}
 
-	err = s.slotServer.Start()
-	if err != nil {
-		return err
-	}
-
 	err = s.eventServer.Start()
-	if err != nil {
-		return err
-	}
-
-	err = s.cfgServer.Start()
 	if err != nil {
 		return err
 	}

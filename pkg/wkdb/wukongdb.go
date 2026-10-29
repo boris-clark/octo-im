@@ -40,6 +40,8 @@ type wukongDB struct {
 	cancelFunc   context.CancelFunc
 
 	metrics trace.IDBMetrics
+	// metricsWG joins the collector before storage and trace ownership return.
+	metricsWG sync.WaitGroup
 
 	channelSeqCache     *channelSeqCache
 	conversationCache   *ConversationCache
@@ -162,7 +164,8 @@ func (wk *wukongDB) Open() error {
 		wk.wkdbs = append(wk.wkdbs, wkdb)
 	}
 
-	go wk.collectMetricsLoop()
+	wk.metricsWG.Add(1)
+	go func() { defer wk.metricsWG.Done(); wk.collectMetricsLoop() }()
 
 	// 启动缓存管理器
 	wk.cacheManager.Start()
@@ -172,6 +175,7 @@ func (wk *wukongDB) Open() error {
 
 func (wk *wukongDB) Close() error {
 	wk.cancelFunc()
+	wk.metricsWG.Wait()
 
 	// 停止缓存管理器
 	if wk.cacheManager != nil {

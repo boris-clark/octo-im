@@ -10,12 +10,25 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 // saveChannelConfig keeps the existing slot log format, but fences the decision
 // at admission. cfg.ConfVersion is the version being replaced (zero for create).
 // All production metadata writers use this method on the current slot leader.
 func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) (uint64, error) {
+	key := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return 0, err
+	}
+	defer s.channelInstallLock.Unlock(key)
+	return s.saveChannelConfigLocked(ctx, cfg)
+}
+
+// The local guard spans fence persistence and slot apply, so another callback
+// cannot mistake an in-flight fence for a crashed installation and supersede it.
+// Distributed ownership still comes from the slot read barrier and applied CAS.
+func (s *Server) saveChannelConfigLocked(ctx context.Context, cfg wkdb.ChannelClusterConfig) (uint64, error) {
 	slotID := s.getSlotId(cfg.ChannelId)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -39,6 +52,11 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			}
 			if current.ConfVersion != cfg.ConfVersion {
 				return 0, raft.ErrConfigVersionStale
+			}
+			if !wkdb.IsEmptyChannelClusterConfig(current) && current.InstalledTerm != 0 && !sameChannelMembership(current, cfg) {
+				if err := s.certifyChannelMembership(ctx, current, &cfg); err != nil {
+					return 0, err
+				}
 			}
 			if cfg.Expected == nil && !wkdb.IsEmptyChannelClusterConfig(current) &&
 				(cfg.Term != current.Term || cfg.LeaderId != current.LeaderId) {

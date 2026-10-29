@@ -16,9 +16,11 @@ import (
 )
 
 type electionFenceRequest struct {
-	Slot    *pb.Slot
-	Channel *wkdb.ChannelClusterConfig
-	Term    uint32
+	// IncludeLearners requests stored-tail witnesses only for a membership install.
+	IncludeLearners bool
+	Slot            *pb.Slot
+	Channel         *wkdb.ChannelClusterConfig
+	Term            uint32
 }
 
 func slotElectionConfig(st *pb.Slot) rt.Config {
@@ -88,7 +90,11 @@ func (s *Server) requestElectionFences(ctx context.Context, cfg rt.Config, req e
 	var mu sync.Mutex
 	var group errgroup.Group
 	seen := make(map[uint64]bool)
-	for _, id := range cfg.Replicas {
+	targets := append([]uint64(nil), cfg.Replicas...)
+	if req.Channel != nil && req.IncludeLearners {
+		targets = append(targets, cfg.Learners...)
+	}
+	for _, id := range targets {
 		if id == 0 || seen[id] {
 			continue
 		}
