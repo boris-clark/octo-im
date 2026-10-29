@@ -9,13 +9,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/cockroachdb/pebble"
 	"go.uber.org/zap"
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	lock := wk.raftLock(wkutil.ChannelToKey(channelId, channelType))
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.AppendMessagesAdd(1)
 
@@ -29,6 +34,37 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}()
 	}
 
+	if len(msgs) == 0 {
+		return nil
+	}
+	hard, err := wk.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return err
+	}
+	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return err
+	}
+	protected := max(applied, hard.CommittedFloor)
+	for _, msg := range msgs {
+		if uint64(msg.MessageSeq) <= protected {
+			stored, err := wk.LoadMsg(channelId, channelType, uint64(msg.MessageSeq))
+			if err != nil {
+				return err
+			}
+			a, err := EncodeChannelLogData(&stored)
+			if err != nil {
+				return err
+			}
+			b, err := EncodeChannelLogData(&msg)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(a, b) {
+				return fmt.Errorf("%w: channel index %d protected %d", types.ErrAppendBelowApplied, msg.MessageSeq, protected)
+			}
+		}
+	}
 	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
 	for _, msg := range msgs {
 		if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
@@ -37,7 +73,7 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 
 	}
 	lastMsg := msgs[len(msgs)-1]
-	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
+	err = wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
 	if err != nil {
 		return err
 	}
@@ -485,6 +521,9 @@ func (wk *wukongDB) LoadNextRangeMsgsForSize(channelId string, channelType uint8
 }
 
 func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSeq uint64) error {
+	lock := wk.raftLock(wkutil.ChannelToKey(channelId, channelType))
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.TruncateLogToAdd(1)
 
@@ -497,8 +536,16 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	if err != nil {
 		return err
 	}
-	if messageSeq < applied {
-		return fmt.Errorf("cannot truncate applied channel log: target=%d applied=%d", messageSeq, applied)
+	hard, err := wk.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return err
+	}
+	if messageSeq < max(applied, hard.CommittedFloor) || hard.BoundaryTerm != 0 {
+		hard.Quarantined = true
+		if err := wk.shardDB(wkutil.ChannelToKey(channelId, channelType)).Set(key.NewRaftHardStateKey(wkutil.ChannelToKey(channelId, channelType)), hard.Marshal(), pebble.Sync); err != nil {
+			return fmt.Errorf("%w: %v", types.ErrTruncateBelowApplied, err)
+		}
+		return fmt.Errorf("%w: channel target=%d protected=%d", types.ErrTruncateBelowApplied, messageSeq, max(applied, hard.CommittedFloor))
 	}
 
 	// 获取最新的消息seq
@@ -524,6 +571,23 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	db := wk.channelBatchDb(channelId, channelType)
 	batch := db.NewBatch()
 	batch.DeleteRange(key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1), key.NewMessagePrimaryKey(channelId, channelType, math.MaxUint64))
+	shardNo := wkutil.ChannelToKey(channelId, channelType)
+	if wk.shardId(shardNo) != wk.channelDbIndex(channelId, channelType) {
+		return fmt.Errorf("atomic channel truncation requires colocated term metadata")
+	}
+	iter := wk.shardDB(shardNo).NewIter(&pebble.IterOptions{LowerBound: key.NewLeaderTermSequenceTermKey(shardNo, 0), UpperBound: key.NewLeaderTermSequenceTermKey(shardNo, math.MaxUint32)})
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if len(iter.Value()) != 8 {
+			return fmt.Errorf("invalid channel term row")
+		}
+		if wk.endian.Uint64(iter.Value()) > messageSeq {
+			batch.Delete(iter.Key())
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return err
+	}
 
 	err = wk.setChannelLastMessageSeq(channelId, channelType, messageSeq, batch)
 	if err != nil {

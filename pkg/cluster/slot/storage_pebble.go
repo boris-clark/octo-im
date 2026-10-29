@@ -190,6 +190,7 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 		return types.RaftState{}, err
 	}
 
+	diverged = diverged || state.Quarantined || state.CommittedFloor > lastLogIndex
 	return types.RaftState{
 		HardState:    state,
 		LastLogIndex: lastLogIndex,
@@ -264,6 +265,11 @@ func (p *PebbleShardLogStorage) validateAppend(shardNo string, logs []types.Log)
 	if err != nil {
 		return nil, err
 	}
+	hard, err := p.hardState(shardNo)
+	if err != nil {
+		return nil, err
+	}
+	applied = max(applied, hard.CommittedFloor)
 	lastIndex, err := p.LastIndex(shardNo)
 	if err != nil {
 		return nil, err
@@ -368,7 +374,14 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		p.Error("get max index error", zap.Error(err))
 		return err
 	}
-	if index < appliedIdx {
+	hard, err := p.hardState(shardNo)
+	if err != nil {
+		return err
+	}
+	if index < max(appliedIdx, hard.CommittedFloor) || hard.BoundaryTerm != 0 {
+		if err := p.MarkDiverged(shardNo, types.ErrTruncateBelowApplied); err != nil {
+			return fmt.Errorf("%w: %v", types.ErrTruncateBelowApplied, err)
+		}
 		// Removing entries the state machine has applied would leave state
 		// that no log entry explains. Refuse without mutating anything.
 		p.divergence().truncateRefused.Add(1)
@@ -378,7 +391,27 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 
 	keyData := key.NewLogKey(shardNo, index+1)
 	maxKeyData := key.NewLogKey(shardNo, math.MaxUint64)
-	err = p.shardDB(shardNo).DeleteRange(keyData, maxKeyData, p.sync)
+	batch := p.shardDB(shardNo).NewBatch()
+	defer batch.Close()
+	if err = batch.DeleteRange(keyData, maxKeyData, nil); err != nil {
+		return err
+	}
+	iter := p.shardDB(shardNo).NewIter(&pebble.IterOptions{LowerBound: key.NewLeaderTermStartIndexKey(shardNo, 0), UpperBound: key.NewLeaderTermStartIndexKey(shardNo, math.MaxUint32)})
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if len(iter.Value()) != 8 {
+			return fmt.Errorf("invalid term row")
+		}
+		if binary.BigEndian.Uint64(iter.Value()) > index {
+			if err = batch.Delete(iter.Key(), nil); err != nil {
+				return err
+			}
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return err
+	}
+	err = batch.Commit(pebble.Sync)
 	if err != nil {
 		return err
 	}
@@ -877,6 +910,25 @@ func (p *PebbleShardLogStorage) DeleteLeaderTermStartIndexGreaterThanTerm(shardN
 // }
 
 func (p *PebbleShardLogStorage) SaveHardState(shardNo string, state types.HardState) error {
+	lock := p.slotLock(shardNo)
+	lock.Lock()
+	defer lock.Unlock()
+	old, err := p.hardState(shardNo)
+	if err != nil {
+		return err
+	}
+	if err = types.ValidateHardStateTransition(old, state); err != nil {
+		return err
+	}
+	if state.CommittedFloor > old.CommittedFloor {
+		last, err := p.lastLog(shardNo)
+		if err != nil {
+			return err
+		}
+		if state.CommittedFloor > last.Index {
+			return fmt.Errorf("commit floor beyond stored tail")
+		}
+	}
 	return p.shardDB(shardNo).Set(key.NewHardStateKey(shardNo), state.Marshal(), pebble.Sync)
 }
 
@@ -893,3 +945,6 @@ func (p *PebbleShardLogStorage) hardState(shardNo string) (types.HardState, erro
 	err = state.Unmarshal(data)
 	return state, err
 }
+
+// AtomicLogTruncation tells the worker that log and term-row deletion share a batch.
+func (*PebbleShardLogStorage) AtomicLogTruncation() {}

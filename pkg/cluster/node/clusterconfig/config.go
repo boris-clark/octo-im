@@ -3,6 +3,7 @@ package clusterconfig
 import (
 	"io"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -19,7 +20,8 @@ type Config struct {
 	wklog.Log
 	mu sync.RWMutex
 	// 是否已初始化
-	inited bool
+	inited       bool
+	durableSlots map[uint32]*types.Slot
 }
 
 func NewConfig(opts *Options) *Config {
@@ -38,6 +40,10 @@ func NewConfig(opts *Options) *Config {
 		cfg.Panic("Load cluster config from file failed!", zap.Error(err))
 	}
 
+	cfg.durableSlots = make(map[uint32]*types.Slot)
+	for _, slot := range cfg.cfg.Slots {
+		cfg.durableSlots[slot.Id] = slot.Clone()
+	}
 	return cfg
 }
 
@@ -107,7 +113,23 @@ func (c *Config) data() ([]byte, error) {
 func (c *Config) update(cfg *types.Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cfg = cfg.Clone()
+	next := cfg.Clone()
+	for _, old := range c.cfg.Slots {
+		found := false
+		for i, st := range next.Slots {
+			if st.Id == old.Id {
+				found = true
+				if !slotUpdateAllowed(old, st) {
+					next.Slots[i] = old.Clone()
+				}
+				break
+			}
+		}
+		if !found {
+			next.Slots = append(next.Slots, old.Clone())
+		}
+	}
+	c.cfg = next
 }
 
 func (c *Config) nodes() []*types.Node {
@@ -222,18 +244,19 @@ func (c *Config) updateNodeJoined(nodeId uint64, slots []*types.Slot) {
 			break
 		}
 	}
-
 	for _, slot := range slots {
-		exist := false
-		for i, s := range c.cfg.Slots {
-			if s.Id == slot.Id {
-				c.cfg.Slots[i] = slot
-				exist = true
+		exists := false
+		for i, old := range c.cfg.Slots {
+			if old.Id == slot.Id {
+				exists = true
+				if slotUpdateAllowed(old, slot) {
+					c.cfg.Slots[i] = slot.Clone()
+				}
 				break
 			}
 		}
-		if !exist {
-			c.cfg.Slots = append(c.cfg.Slots, slot)
+		if !exists {
+			c.cfg.Slots = append(c.cfg.Slots, slot.Clone())
 		}
 	}
 }
@@ -243,7 +266,7 @@ func (c *Config) updateSlotMigrate(slotId uint32, fromNodeId, toNodeId uint64) {
 	defer c.mu.Unlock()
 
 	for _, slot := range c.cfg.Slots {
-		if slot.Id == slotId && slot.MigrateFrom == 0 && slot.MigrateTo == 0 {
+		if slot.Id == slotId && slot.InstalledTerm == 0 && slot.MigrateFrom == 0 && slot.MigrateTo == 0 {
 			slot.MigrateFrom = fromNodeId
 			slot.MigrateTo = toNodeId
 			if !wkutil.ArrayContainsUint64(slot.Replicas, toNodeId) { // 如果目标节点不在副本列表里，则要加入学习者列表
@@ -270,15 +293,21 @@ func (c *Config) updateSlotStatus(slotId uint32, status types.SlotStatus) {
 func (c *Config) updateSlots(slots []*types.Slot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	for _, slot := range slots {
-		for i, s := range c.cfg.Slots {
-			if s.Id == slot.Id {
-				c.cfg.Slots[i] = slot
+		for i, old := range c.cfg.Slots {
+			if old.Id == slot.Id && slotUpdateAllowed(old, slot) {
+				c.cfg.Slots[i] = slot.Clone()
 				break
 			}
 		}
 	}
+}
+
+func slotUpdateAllowed(old, next *types.Slot) bool {
+	if old.Term != next.Term || old.Leader != next.Leader || old.InstalledTerm != next.InstalledTerm || old.BoundaryTerm != next.BoundaryTerm {
+		return false
+	}
+	return old.InstalledTerm == 0 || slices.Equal(old.Replicas, next.Replicas) && slices.Equal(old.Learners, next.Learners) && old.MigrateFrom == next.MigrateFrom && old.MigrateTo == next.MigrateTo
 }
 
 func (c *Config) updateNodeStatus(nodeId uint64, status types.NodeStatus) {
@@ -317,7 +346,7 @@ func (c *Config) slot(id uint32) *types.Slot {
 	defer c.mu.RUnlock()
 	for _, slot := range c.cfg.Slots {
 		if slot.Id == id {
-			return slot
+			return slot.Clone()
 		}
 	}
 	return nil
@@ -476,6 +505,13 @@ func (c *Config) saveConfig() error {
 	_, err = c.cfgFile.Write([]byte(wkutil.ToJSON(c.cfg)))
 	if err != nil {
 		return err
+	}
+	if err := c.cfgFile.Sync(); err != nil {
+		return err
+	}
+	c.durableSlots = make(map[uint32]*types.Slot)
+	for _, slot := range c.cfg.Slots {
+		c.durableSlots[slot.Id] = slot.Clone()
 	}
 	return nil
 }

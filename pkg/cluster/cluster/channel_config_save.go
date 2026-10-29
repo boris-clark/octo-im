@@ -40,7 +40,7 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 				if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 					return err
 				}
-				if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term {
+				if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term || cfg.Expected != nil && !current.Equal(*cfg.Expected) {
 					return raft.ErrConfigVersionStale
 				}
 				return nil
@@ -65,6 +65,18 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			}
 			version, err := s.slotServer.ProposeAfterRead(ctx, slotID, before, data, validate)
 			if !errors.Is(err, raftgroup.ErrReadStateChanged) {
+				if cfg.Expected != nil || err == nil {
+					current, readErr := s.fencedChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+					desired := cfg.Clone()
+					desired.Id = current.Id
+					desired.ConfVersion = current.ConfVersion
+					if readErr == nil && current.Equal(desired) {
+						return current.ConfVersion, nil
+					}
+					if err == nil {
+						err = raft.ErrConfigVersionStale
+					}
+				}
 				return version, err
 			}
 		}

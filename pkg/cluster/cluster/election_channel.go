@@ -10,6 +10,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
@@ -85,7 +86,10 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 	if err != nil {
 		return current, err
 	}
-	membersChanged, err := s.joinNewRepliceIfNeed(&cfg)
+	membersChanged := false
+	if !leaderChanged {
+		membersChanged, err = s.joinNewRepliceIfNeed(&cfg)
+	}
 	if err != nil {
 		return current, err
 	}
@@ -97,6 +101,7 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 		return current, err
 	}
 	cfg.ConfVersion = version
+	cfg.Expected = nil
 	return cfg, nil
 }
 
@@ -155,21 +160,23 @@ func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelCluste
 		return false, nil
 	}
 
-	// 获得在线的副本
-	onlineRepics := make([]uint64, 0, len(cfg.Replicas))
-	for _, replicaId := range cfg.Replicas {
-		if s.cfgServer.NodeIsOnline(replicaId) {
-			onlineRepics = append(onlineRepics, replicaId)
-		}
-	}
-
-	// 获得在线的副本的最新日志信息
-	replicaLastLogInfos, err := s.requestChannelLastLogInfos(ctx, onlineRepics, cfg.ChannelId, cfg.ChannelType)
+	expected := cfg.Clone()
+	reports, err := s.requestElectionFences(ctx, channelElectionConfig(expected), electionFenceRequest{Channel: &expected})
 	if err != nil {
-		s.Error("requestChannelLastLogInfos failed", zap.Error(err))
 		return false, err
 	}
-	return electChannelLeader(cfg, replicaLastLogInfos)
+	leader, err := rafttypes.SelectFencedLeader(channelElectionConfig(expected), expected.Term+1, reports)
+	if err != nil {
+		return false, err
+	}
+	cfg.LeaderId = leader
+	cfg.Term++
+	cfg.InstalledTerm = cfg.Term
+	for _, report := range reports {
+		cfg.BoundaryTerm = max(cfg.BoundaryTerm, report.BoundaryTerm)
+	}
+	cfg.Expected = &expected
+	return true, nil
 }
 
 // Only current voting replicas count. Desired capacity and learners do not
@@ -276,6 +283,7 @@ func (s *Server) createChannelClusterConfig(channelId string, channelType uint8)
 		ChannelType:     channelType,
 		ReplicaMaxCount: uint16(s.opts.ConfigOptions.ChannelMaxReplicaCount),
 		Term:            1,
+		InstalledTerm:   1,
 		LeaderId:        s.opts.ConfigOptions.NodeId,
 		CreatedAt:       &createdAt,
 		UpdatedAt:       &updatedAt,

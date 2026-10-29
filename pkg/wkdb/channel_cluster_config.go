@@ -2,7 +2,9 @@ package wkdb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
@@ -27,6 +29,31 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 	wk.dblock.channelClusterConfig.lockByChannel(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 	defer wk.dblock.channelClusterConfig.unlockByChannel(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 
+	current, err := wk.GetChannelClusterConfig(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
+	if err != nil && err != ErrNotFound {
+		return err
+	}
+	if channelClusterConfig.Expected != nil {
+		expected := channelClusterConfig.Expected
+		if !current.Equal(*expected) {
+			return nil
+		}
+		if expected.Term == ^uint32(0) || channelClusterConfig.Term != expected.Term+1 || channelClusterConfig.InstalledTerm != channelClusterConfig.Term || channelClusterConfig.LeaderId == 0 || !sameChannelVoters(current, channelClusterConfig) {
+			return nil
+		}
+	} else if !IsEmptyChannelClusterConfig(current) {
+		if current.Term != channelClusterConfig.Term || current.LeaderId != channelClusterConfig.LeaderId || current.InstalledTerm != channelClusterConfig.InstalledTerm || current.BoundaryTerm != channelClusterConfig.BoundaryTerm {
+			return nil
+		}
+		if current.InstalledTerm != 0 && !sameChannelVoters(current, channelClusterConfig) {
+			return nil
+		}
+	}
+	if current.BoundaryTerm != 0 && current.BoundaryTerm != channelClusterConfig.BoundaryTerm {
+		return nil
+	}
+
+	channelClusterConfig.Expected = nil
 	primaryKey := key.ChannelToNum(channelClusterConfig.ChannelId, channelClusterConfig.ChannelType)
 
 	// oldChannelClusterConfig, err := wk.getChannelClusterConfigById(primaryKey)
@@ -60,7 +87,7 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 		return err
 	}
 
-	err := batch.CommitWait()
+	err = batch.CommitWait()
 	if err != nil {
 		return err
 	}
@@ -71,66 +98,12 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 	return nil
 }
 
-func (wk *wukongDB) SaveChannelClusterConfigs(channelClusterConfigs []ChannelClusterConfig) error {
-
-	if wk.opts.EnableCost {
-		start := time.Now()
-		defer func() {
-			end := time.Since(start)
-			if end > time.Millisecond*500 {
-				wk.Warn("SaveChannelClusterConfigs too cost", zap.Duration("cost", time.Since(start)), zap.Int("count", len(channelClusterConfigs)))
-			}
-		}()
-	}
-
-	wk.metrics.SaveChannelClusterConfigsAdd(1)
-
-	db := wk.defaultShardBatchDB()
-	// batch := db.NewBatch()
-	// 先删除旧的
-
-	// for i, cfg := range channelClusterConfigs {
-	// 	primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
-	// 	oldChannelClusterConfig, err := wk.getChannelClusterConfigById(primaryKey)
-	// 	if err != nil && err != ErrNotFound {
-	// 		return err
-	// 	}
-	// 	existConfig := !IsEmptyChannelClusterConfig(oldChannelClusterConfig)
-
-	// 	// 删除旧的索引
-	// 	if existConfig {
-	// 		oldChannelClusterConfig.CreatedAt = nil // 旧的创建时间不参与索引
-	// 		err = wk.deleteChannelClusterConfigIndex(oldChannelClusterConfig.Id, oldChannelClusterConfig, batch)
-	// 		if err != nil {
-	// 			wk.Error("delete channel cluster config index error", zap.Error(err), zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType))
-	// 			return err
-	// 		}
-	// 	}
-	// 	channelClusterConfigs[i].Id = primaryKey
-	// 	if existConfig {
-	// 		channelClusterConfigs[i].CreatedAt = nil // 创建时间不参与更新
-	// 	}
-	// }
-
-	// if err := batch.CommitWait(); err != nil {
-	// 	return err
-	// }
-	// 再添加新的
-	batch := db.NewBatch()
-	for _, cfg := range channelClusterConfigs {
-		primaryKey := key.ChannelToNum(cfg.ChannelId, cfg.ChannelType)
-		if err := wk.writeChannelClusterConfig(primaryKey, cfg, batch); err != nil {
+func (wk *wukongDB) SaveChannelClusterConfigs(configs []ChannelClusterConfig) error {
+	for _, cfg := range configs {
+		if err := wk.SaveChannelClusterConfig(cfg); err != nil {
 			return err
 		}
 	}
-	err := batch.CommitWait()
-	if err != nil {
-		return err
-	}
-
-	// 批量更新缓存
-	wk.clusterConfigCache.BatchSetChannelClusterConfigs(channelClusterConfigs)
-
 	return nil
 }
 
@@ -476,6 +449,10 @@ func (wk *wukongDB) writeChannelClusterConfig(primaryKey uint64, channelClusterC
 
 	// term
 	termBytes := make([]byte, 4)
+	markers := make([]byte, 8)
+	binary.BigEndian.PutUint32(markers, channelClusterConfig.InstalledTerm)
+	binary.BigEndian.PutUint32(markers[4:], channelClusterConfig.BoundaryTerm)
+	w.Set(key.NewChannelClusterConfigColumnKey(primaryKey, [2]byte{0x0B, 0x0F}), markers)
 	binary.BigEndian.PutUint32(termBytes, channelClusterConfig.Term)
 	w.Set(key.NewChannelClusterConfigColumnKey(primaryKey, key.TableChannelClusterConfig.Column.Term), termBytes)
 
@@ -624,6 +601,12 @@ func (wk *wukongDB) iteratorChannelClusterConfig(iter *pebble.Iterator, iterFnc 
 			preChannelClusterConfig.Learners = learners
 		case key.TableChannelClusterConfig.Column.LeaderId:
 			preChannelClusterConfig.LeaderId = wk.endian.Uint64(iter.Value())
+		case [2]byte{0x0B, 0x0F}:
+			if len(iter.Value()) != 8 {
+				return fmt.Errorf("invalid channel install markers")
+			}
+			preChannelClusterConfig.InstalledTerm = wk.endian.Uint32(iter.Value())
+			preChannelClusterConfig.BoundaryTerm = wk.endian.Uint32(iter.Value()[4:])
 		case key.TableChannelClusterConfig.Column.Term:
 			preChannelClusterConfig.Term = wk.endian.Uint32(iter.Value())
 		case key.TableChannelClusterConfig.Column.MigrateFrom:
@@ -658,4 +641,8 @@ func (wk *wukongDB) iteratorChannelClusterConfig(iter *pebble.Iterator, iterFnc 
 		_ = iterFnc(preChannelClusterConfig)
 	}
 	return nil
+}
+
+func sameChannelVoters(a, b ChannelClusterConfig) bool {
+	return slices.Equal(a.Replicas, b.Replicas) && slices.Equal(a.Learners, b.Learners) && a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo
 }

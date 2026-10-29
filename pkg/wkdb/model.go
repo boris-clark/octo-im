@@ -1,6 +1,7 @@
 package wkdb
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -588,32 +589,36 @@ const (
 
 // 频道分布式配置
 type ChannelClusterConfig struct {
-	Id              uint64               `json:"id,omitempty"`                // ID
-	ChannelId       string               `json:"channel_id,omitempty"`        // 频道ID
-	ChannelType     uint8                `json:"channel_type,omitempty"`      // 频道类型
-	ReplicaMaxCount uint16               `json:"replica_max_count,omitempty"` // 副本最大数量
-	Replicas        []uint64             `json:"replicas,omitempty"`          // 副本节点ID集合
-	Learners        []uint64             `json:"learners,omitempty"`          // 学习者节点ID集合
-	LeaderId        uint64               `json:"learder_id,omitempty"`        // 领导者ID
-	Term            uint32               `json:"term,omitempty"`              // 任期
-	MigrateFrom     uint64               `json:"migrate_from,omitempty"`      // 迁移源
-	MigrateTo       uint64               `json:"migrate_to,omitempty"`        // 迁移目标
-	Status          ChannelClusterStatus `json:"status,omitempty"`            // 状态
-	ConfVersion     uint64               `json:"conf_version,omitempty"`      // 配置文件版本号
-	CreatedAt       *time.Time           `json:"created_at,omitempty"`        // 创建时间
-	UpdatedAt       *time.Time           `json:"updated_at,omitempty"`        // 更新时间
+	InstalledTerm   uint32                `json:"installed_term,omitempty"`
+	BoundaryTerm    uint32                `json:"boundary_term,omitempty"`
+	Expected        *ChannelClusterConfig `json:"expected,omitempty"`
+	Id              uint64                `json:"id,omitempty"`                // ID
+	ChannelId       string                `json:"channel_id,omitempty"`        // 频道ID
+	ChannelType     uint8                 `json:"channel_type,omitempty"`      // 频道类型
+	ReplicaMaxCount uint16                `json:"replica_max_count,omitempty"` // 副本最大数量
+	Replicas        []uint64              `json:"replicas,omitempty"`          // 副本节点ID集合
+	Learners        []uint64              `json:"learners,omitempty"`          // 学习者节点ID集合
+	LeaderId        uint64                `json:"learder_id,omitempty"`        // 领导者ID
+	Term            uint32                `json:"term,omitempty"`              // 任期
+	MigrateFrom     uint64                `json:"migrate_from,omitempty"`      // 迁移源
+	MigrateTo       uint64                `json:"migrate_to,omitempty"`        // 迁移目标
+	Status          ChannelClusterStatus  `json:"status,omitempty"`            // 状态
+	ConfVersion     uint64                `json:"conf_version,omitempty"`      // 配置文件版本号
+	CreatedAt       *time.Time            `json:"created_at,omitempty"`        // 创建时间
+	UpdatedAt       *time.Time            `json:"updated_at,omitempty"`        // 更新时间
 
 	version uint16 // 数据协议版本
 }
 
 func (c *ChannelClusterConfig) Clone() ChannelClusterConfig {
 	return ChannelClusterConfig{
+		InstalledTerm: c.InstalledTerm, BoundaryTerm: c.BoundaryTerm, Expected: c.Expected,
 		Id:              c.Id,
 		ChannelId:       c.ChannelId,
 		ChannelType:     c.ChannelType,
 		ReplicaMaxCount: c.ReplicaMaxCount,
-		Replicas:        c.Replicas,
-		Learners:        c.Learners,
+		Replicas:        append([]uint64(nil), c.Replicas...),
+		Learners:        append([]uint64(nil), c.Learners...),
 		LeaderId:        c.LeaderId,
 		Term:            c.Term,
 		MigrateFrom:     c.MigrateFrom,
@@ -627,6 +632,9 @@ func (c *ChannelClusterConfig) Clone() ChannelClusterConfig {
 }
 
 func (c *ChannelClusterConfig) Equal(cfg ChannelClusterConfig) bool {
+	if c.InstalledTerm != cfg.InstalledTerm || c.BoundaryTerm != cfg.BoundaryTerm {
+		return false
+	}
 	if c.Id != cfg.Id {
 		return false
 	}
@@ -677,6 +685,11 @@ func (c *ChannelClusterConfig) Equal(cfg ChannelClusterConfig) bool {
 }
 
 func (c *ChannelClusterConfig) Marshal() ([]byte, error) {
+	if c.InstalledTerm != 0 || c.BoundaryTerm != 0 || c.Expected != nil {
+		type payload ChannelClusterConfig
+		b, err := json.Marshal((*payload)(c))
+		return append([]byte{0, 2}, b...), err
+	}
 	c.version = 1
 	enc := wkproto.NewEncoder()
 	defer enc.End()
@@ -716,6 +729,10 @@ func (c *ChannelClusterConfig) Marshal() ([]byte, error) {
 }
 
 func (c *ChannelClusterConfig) Unmarshal(data []byte) error {
+	if len(data) >= 2 && data[0] == 0 && data[1] == 2 {
+		type payload ChannelClusterConfig
+		return json.Unmarshal(data[2:], (*payload)(c))
+	}
 	dec := wkproto.NewDecoder(data)
 	var err error
 	if c.version, err = dec.Uint16(); err != nil {

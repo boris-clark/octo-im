@@ -75,6 +75,7 @@ func (h *handler) handleClusterInit() {
 			// 随机选举一个领导者
 			randomIndex := globalRand.Intn(len(slot.Replicas))
 			slot.Term = 1
+			slot.InstalledTerm = 1
 			slot.Leader = slot.Replicas[randomIndex]
 			cfg.Slots = append(cfg.Slots, slot)
 		}

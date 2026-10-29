@@ -196,7 +196,9 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 			return
 		}
 		// 删除本地的leader term start index
-		err = op.storage.DeleteLeaderTermStartIndexGreaterThanTerm(op.key, e.LastLogTerm)
+		if _, atomic := op.storage.(interface{ AtomicLogTruncation() }); !atomic {
+			err = op.storage.DeleteLeaderTermStartIndexGreaterThanTerm(op.key, e.LastLogTerm)
+		}
 		if err != nil {
 			rg.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
 			rg.completeStorageOperation(op, types.Event{

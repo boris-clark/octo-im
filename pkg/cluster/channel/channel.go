@@ -92,12 +92,21 @@ func (ch *Channel) applyConfig(ctx context.Context, cfg rafttype.Config) error {
 // will subsequently run its Step/Tick/Ready calls. No storage or network I/O.
 func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 	current := ch.Config()
+	if ch.PendingElectionFence() && cfg.Term < current.Term {
+		return ch.RestoreElectionFence(cfg)
+	}
 	if cfg.Version < current.Version {
 		return fmt.Errorf("%w: incoming=%d runtime=%d", raft.ErrConfigVersionStale, cfg.Version, current.Version)
 	}
 	// Match Raft's normalization before the idempotency comparison. Restored
 	// hard state can exceed metadata; the slot owner repairs that metadata later.
-	cfg.Term = max(cfg.Term, current.Term)
+	if current.FenceEnabled || cfg.InstalledTerm != 0 {
+		if cfg.Term < current.Term {
+			return raft.ErrElectionNotInstalled
+		}
+	} else {
+		cfg.Term = max(cfg.Term, current.Term)
+	}
 	if !slices.Contains(cfg.Replicas, ch.s.opts.NodeId) {
 		cfg.Role = rafttype.RoleLearner
 		if cfg.Leader == ch.s.opts.NodeId {
@@ -151,7 +160,7 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 }
 
 func sameChannelConfig(a, b rafttype.Config) bool {
-	return a.Version == b.Version && a.Term == b.Term && a.Leader == b.Leader && a.Role == b.Role &&
+	return a.InstalledTerm == b.InstalledTerm && a.BoundaryTerm == b.BoundaryTerm && a.FenceEnabled == b.FenceEnabled && a.Version == b.Version && a.Term == b.Term && a.Leader == b.Leader && a.Role == b.Role &&
 		a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo &&
 		slices.Equal(a.Replicas, b.Replicas) && slices.Equal(a.Learners, b.Learners)
 }
@@ -170,6 +179,7 @@ func channelConfigToRaftConfig(currentNodeId uint64, cfg wkdb.ChannelClusterConf
 	}
 
 	return types.Config{
+		InstalledTerm: cfg.InstalledTerm, BoundaryTerm: cfg.BoundaryTerm, FenceEnabled: cfg.InstalledTerm != 0,
 		MigrateFrom: cfg.MigrateFrom,
 		MigrateTo:   cfg.MigrateTo,
 		Replicas:    cfg.Replicas,

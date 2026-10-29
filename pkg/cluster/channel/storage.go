@@ -102,8 +102,12 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 	if err != nil {
 		return types.RaftState{}, err
 	}
+	if state.CommittedFloor > uint64(lastMsg.MessageSeq) {
+		return types.RaftState{}, fmt.Errorf("channel committed floor exceeds stored tail")
+	}
 	return types.RaftState{
 		HardState:    state,
+		Diverged:     state.Quarantined,
 		LastLogIndex: uint64(lastMsg.MessageSeq),
 		LastTerm:     uint32(lastMsg.Term),
 		AppliedIndex: applied,
@@ -276,4 +280,16 @@ func (s *storage) LastIndexAndAppendTime(shardNo string) (uint64, uint64, error)
 func (s *storage) getLastMessage(channelId string, channelType uint8) (wkdb.Message, error) {
 
 	return s.db.GetLastMsg(channelId, channelType)
+}
+
+func (*storage) AtomicLogTruncation() {}
+
+// MarkDiverged persists the existing replica's quarantine through the same hard-state domain.
+func (s *storage) MarkDiverged(key string, cause error) error {
+	hard, err := s.db.RaftHardState(key)
+	if err != nil {
+		return err
+	}
+	hard.Quarantined = true
+	return s.db.SaveRaftHardState(key, hard)
 }

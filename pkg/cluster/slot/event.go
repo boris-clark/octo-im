@@ -49,6 +49,10 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 		_, err := s.raftGroup.InitializeRaft(ctx, shardNo, func() (raftgroup.IRaft, error) {
 			return newSlot(slot, s)
 		}, func(candidate raftgroup.IRaft) error {
+			st := candidate.(*Slot)
+			if st.PendingElectionFence() {
+				return st.RestoreElectionFence(s.slotToConfig(slot))
+			}
 			return candidate.Step(rafttype.Event{Type: rafttype.ConfChange, Config: s.slotToConfig(slot)})
 		})
 		if err != nil {
@@ -81,6 +85,7 @@ func (s *Server) slotToConfig(st *types.Slot) rafttype.Config {
 	}
 
 	cfg := rafttype.Config{
+		InstalledTerm: st.InstalledTerm, BoundaryTerm: st.BoundaryTerm, FenceEnabled: st.InstalledTerm != 0,
 		MigrateFrom: st.MigrateFrom,
 		MigrateTo:   st.MigrateTo,
 		Replicas:    st.Replicas,

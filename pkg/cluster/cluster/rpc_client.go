@@ -241,15 +241,18 @@ func (r *rpcClient) RequestClusterLogs(nodeId uint64, req *clusterLogsReq) ([]ra
 
 func (r *rpcClient) request(nodeId uint64, path string, body []byte) ([]byte, error) {
 
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.requestWithContext(timeoutCtx, nodeId, path, body)
+}
+
+func (r *rpcClient) requestWithContext(ctx context.Context, nodeId uint64, path string, body []byte) ([]byte, error) {
 	node := r.s.nodeManager.node(nodeId)
 	if node == nil {
 		return nil, fmt.Errorf("node[%d] not exist", nodeId)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
-	resp, err := node.RequestWithContext(timeoutCtx, path, body)
+	resp, err := node.RequestWithContext(ctx, path, body)
 	if err != nil {
 		return nil, err
 	}

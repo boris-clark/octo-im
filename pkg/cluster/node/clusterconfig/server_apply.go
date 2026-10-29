@@ -73,6 +73,8 @@ func (s *Server) applyLog(log types.Log) error {
 
 func (s *Server) handleCmd(cmd *CMD) error {
 	switch cmd.CmdType {
+	case CMDTypeSlotInstall:
+		return s.handleSlotInstall(cmd)
 	case CMDTypeConfigChange: // 配置改变
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变

@@ -41,6 +41,9 @@ func (n *Node) sendNotifySync(to uint64) {
 }
 
 func (n *Node) sendSyncReq() {
+	if n.fenceEnabled() && n.safetyState.InstalledTerm != n.cfg.Term {
+		return
+	}
 
 	if n.truncating || n.syncing { // 如果在截断中，则发起同步没用
 		return

@@ -69,6 +69,7 @@ func (r *rpcServer) setRoutes() {
 
 	// 获取槽最新日志信息
 	r.s.netServer.Route("/rpc/slot/lastLogInfo", r.handleSlotLastLogInfo)
+	r.s.netServer.Route("/rpc/election/fence", r.handleElectionFence)
 	// 请求唤醒频道领导
 	r.s.netServer.Route("/rpc/channel/wakeLeaderIfNeed", r.handleWakeLeaderIfNeed)
 
