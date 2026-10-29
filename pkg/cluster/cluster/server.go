@@ -44,8 +44,13 @@ type Server struct {
 	// 槽分布式服务
 	slotServer *slot.Server
 	// channel分布式服务
-	channelServer    *channel.Server
-	configReconciler *channelConfigReconciler
+	channelServer *channel.Server
+	// configReconcilerMu publishes fully initialized generations to callbacks.
+	// Retiring generations stay tracked until joined, including during shutdown.
+	configReconcilerMu      sync.RWMutex
+	configReconciler        *channelConfigReconciler
+	configReconcilers       map[*channelConfigReconciler]struct{}
+	configReconcilerClosing bool
 	// 分布式存储
 	store *store.Store
 	// 节点管理
@@ -255,7 +260,7 @@ func (s *Server) Start() error {
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
 	}
-	s.configReconciler.start()
+	s.channelConfigReconciler().start()
 
 	return nil
 }
@@ -279,7 +284,7 @@ func (s *Server) StopWithContext(ctx context.Context) error {
 		// lifecycle so ctx bounds the wait while storage stays owned.
 		joined := make(chan struct{})
 		go func() {
-			s.configReconciler.stop()
+			s.stopChannelConfigReconcilers()
 			s.stopper.Stop()
 			s.eventServer.Stop()
 			close(joined)
@@ -405,7 +410,9 @@ func (s *Server) GetStore() *store.Store {
 
 // 配置改变
 func (s *Server) OnConfigChange(cfg *types.Config) {
-	s.configReconciler.rescan()
+	if r := s.channelConfigReconciler(); r != nil {
+		r.rescan()
+	}
 
 	nodeMap := make(map[uint64]string)
 	for _, node := range cfg.Nodes {
