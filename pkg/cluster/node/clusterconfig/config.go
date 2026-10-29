@@ -110,6 +110,16 @@ func (c *Config) data() ([]byte, error) {
 	return c.cfg.Marshal()
 }
 
+// snapshot keeps all mutable protobuf state owned by the config lock.
+func (c *Config) snapshot() *types.Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cfg == nil {
+		return nil
+	}
+	return c.cfg.Clone()
+}
+
 func (c *Config) update(cfg *types.Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

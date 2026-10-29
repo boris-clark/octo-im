@@ -339,10 +339,7 @@ func (s *Server) LeaderId() uint64 {
 }
 
 func (s *Server) GetClusterConfig() *types.Config {
-	if s.config.cfg == nil {
-		return nil
-	}
-	return s.config.cfg
+	return s.config.snapshot()
 }
 
 // 是否已初始化
