@@ -43,3 +43,36 @@ failures: TestLogConflict1, TestLogConflict2, TestElection, TestPropose,
 TestProposeBatch and TestApply. Two large property tests are omitted from the
 bounded broad runs; they are not claimed as passing at the final head. No test
 assertion or timeout is relaxed.
+
+## Current-term channel recovery continuation (XIN-2632)
+
+When an existing channel has an old-term suffix without an authenticated commit
+floor, the single-voter configuration callback now admits a current-term no-op
+and waits for its ordinary store completion and durable commit transition.
+Direct message retries can resume the same path after a config caller expires.
+Owner retries reuse an already buffered current-term entry. Stored or applied
+history alone still cannot manufacture a committed floor.
+
+The no-op uses log identity zero and the reserved payload `WKRAFT-NOOP` followed
+by byte 1. Its index/term are persisted outside message rows under key namespace
+`0x1B02`, together with its term boundary in one synced metadata batch. Recovery
+and replication merge these entries with messages; application message scans
+never expose a synthetic message. A barrier consumes a sequence number, so the
+next real message can have a gap in its sequence. Mixed appends store segments
+in log order so a failure cannot expose a later message before its barrier.
+Colocated truncation removes discarded barriers and term rows in the same batch.
+
+`recovery_barrier_test.go` in the channel and Raft packages covers term, store
+and floor failures, caller expiry and direct retry, exact retained identity,
+continued writes, two reopens, catch-up and a subsequent two-voter commitment.
+`recovery_controls.py` prepares removal controls without modifying the checkout.
+The existing config-resume assertions now expect the extra committed no-op;
+they retain positive recovery and continued-write requirements. The original
+test sources remain available at the continuation's starting commit.
+
+This is a storage and replication format increment, not a compatibility
+acceptance. Older readers do not understand barriers. Historic store behavior,
+mixed binaries, sequence-gap consumers and operational adoption require a
+separate acceptance gate. Ordinary message/term atomic append, cross-shard
+truncation, shared-domain/E3/24-entry admission, full controller/RPC/startup
+failure recovery, and the inherited unmodified loss oracles remain open.

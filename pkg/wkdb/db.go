@@ -8,6 +8,10 @@ import (
 type DB interface {
 	SaveRaftHardState(shardNo string, state types.HardState) error
 	RaftHardState(shardNo string) (types.HardState, error)
+	// Channel replication barriers are separate from user-visible message rows.
+	AppendChannelNoop(shardNo string, log types.Log) error
+	ChannelNoops(shardNo string, start, end uint64) ([]types.Log, error)
+	LastChannelNoop(shardNo string) (types.Log, error)
 	Open() error
 	Close() error
 	// 获取下一个主键

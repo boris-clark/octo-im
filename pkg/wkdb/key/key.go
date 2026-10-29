@@ -1170,3 +1170,13 @@ func NewMessageEventSeqKey(channelId string, channelType uint8, clientMsgNo stri
 func NewRaftHardStateKey(shardNo string) []byte {
 	return append([]byte{0x1B, 0x01, dataTypeOther, 0}, []byte(shardNo)...)
 }
+
+// NewChannelNoopKey keeps replication barriers outside application messages.
+func NewChannelNoopKey(shardNo string, index uint64) []byte {
+	k := make([]byte, 6+len(shardNo)+8)
+	copy(k, []byte{0x1B, 0x02, dataTypeOther, 0})
+	binary.BigEndian.PutUint16(k[4:], uint16(len(shardNo)))
+	copy(k[6:], shardNo)
+	binary.BigEndian.PutUint64(k[6+len(shardNo):], index)
+	return k
+}

@@ -62,6 +62,9 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 			owner, term, version = ch, ch.Config().Term, ch.Config().Version
 			revision = ch.LogRevision()
 			for _, log := range ch.BufferedLogs() {
+				if types.IsNoop(log) {
+					continue
+				}
 				var m wkdb.Message
 				if err := m.Unmarshal(log.Data); err != nil {
 					return err
@@ -157,7 +160,9 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				}
 				proposed = true
 			}
-			ch.ResumeReplication()
+			if _, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()}); err != nil {
+				return err
+			}
 			return nil
 		})
 	}

@@ -442,12 +442,13 @@ func (c *Config) onlineNodes() []*types.Node {
 	return nodes
 }
 
+// node returns an immutable snapshot; apply workers retain ownership of cfg.
 func (c *Config) node(id uint64) *types.Node {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, n := range c.cfg.Nodes {
 		if n.Id == id {
-			return n
+			return n.Clone()
 		}
 	}
 	return nil

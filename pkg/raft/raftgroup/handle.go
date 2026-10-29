@@ -22,7 +22,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 		reason := types.ReasonOk
 		if err != nil {
 			if !isDivergence(err) {
-				rg.Panic("append logs failed", zap.Error(err))
+				rg.Error("append logs failed", zap.Error(err))
 			}
 			reason = types.ReasonError
 			if isDivergence(err) {

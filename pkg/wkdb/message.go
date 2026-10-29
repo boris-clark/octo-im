@@ -46,7 +46,23 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		return err
 	}
 	protected := max(applied, hard.CommittedFloor)
+	first, last := uint64(msgs[0].MessageSeq), uint64(msgs[0].MessageSeq)
 	for _, msg := range msgs {
+		first = min(first, uint64(msg.MessageSeq))
+		last = max(last, uint64(msg.MessageSeq))
+	}
+	barriers, err := wk.ChannelNoops(wkutil.ChannelToKey(channelId, channelType), first, last+1)
+	if err != nil {
+		return err
+	}
+	barrierIndexes := make(map[uint64]bool, len(barriers))
+	for _, barrier := range barriers {
+		barrierIndexes[barrier.Index] = true
+	}
+	for _, msg := range msgs {
+		if barrierIndexes[uint64(msg.MessageSeq)] {
+			return fmt.Errorf("%w: message would replace a replication barrier", types.ErrAppendBelowApplied)
+		}
 		if uint64(msg.MessageSeq) <= protected {
 			stored, err := wk.LoadMsg(channelId, channelType, uint64(msg.MessageSeq))
 			if err != nil {
@@ -555,7 +571,12 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 		return err
 	}
 
-	if messageSeq >= lastMsgSeq {
+	shardNo := wkutil.ChannelToKey(channelId, channelType)
+	barrier, err := wk.LastChannelNoop(shardNo)
+	if err != nil {
+		return err
+	}
+	if messageSeq >= max(lastMsgSeq, barrier.Index) {
 		return nil
 	}
 
@@ -571,10 +592,10 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	db := wk.channelBatchDb(channelId, channelType)
 	batch := db.NewBatch()
 	batch.DeleteRange(key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1), key.NewMessagePrimaryKey(channelId, channelType, math.MaxUint64))
-	shardNo := wkutil.ChannelToKey(channelId, channelType)
 	if wk.shardId(shardNo) != wk.channelDbIndex(channelId, channelType) {
 		return fmt.Errorf("atomic channel truncation requires colocated term metadata")
 	}
+	batch.DeleteRange(key.NewChannelNoopKey(shardNo, messageSeq+1), key.NewChannelNoopKey(shardNo, math.MaxUint64))
 	iter := wk.shardDB(shardNo).NewIter(&pebble.IterOptions{LowerBound: key.NewLeaderTermSequenceTermKey(shardNo, 0), UpperBound: key.NewLeaderTermSequenceTermKey(shardNo, math.MaxUint32)})
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -589,7 +610,25 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 		return err
 	}
 
-	err = wk.setChannelLastMessageSeq(channelId, channelType, messageSeq, batch)
+	// Message scans retain their own tail; a barrier has no message row.
+	messageTail := uint64(0)
+	messageIter := wk.channelDb(channelId, channelType).NewIter(&pebble.IterOptions{
+		LowerBound: key.NewMessagePrimaryKey(channelId, channelType, 0),
+		UpperBound: key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1),
+	})
+	if messageIter.Last() {
+		messageTail, _, err = key.ParseMessageColumnKey(messageIter.Key())
+	}
+	if err == nil {
+		err = messageIter.Error()
+	}
+	if closeErr := messageIter.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	err = wk.setChannelLastMessageSeq(channelId, channelType, messageTail, batch)
 	if err != nil {
 		return err
 	}

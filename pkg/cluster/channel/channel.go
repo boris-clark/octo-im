@@ -128,7 +128,7 @@ func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 
 func (ch *Channel) resumeConfig(ctx context.Context) error {
 	// Keep this owner hop after ConfChange: Ready must persist a newly
-	// selected term before ResumeReplication can certify the stored tail.
+	// selected term before admitting a current-term recovery barrier.
 	// Retry outside the owner so Ready can retry a transient hard-state write.
 	// Foreground sends/config callbacks must not receive a terminal error for
 	// the first not-ready observation after their config has already applied.
@@ -143,7 +143,13 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 				if !ch.LeaderReadReady() {
 					return ErrConfigNotReady
 				}
-				ch.ResumeReplication()
+				index, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
+				if err != nil {
+					return err
+				}
+				if ch.CommittedIndex() < index {
+					return ErrConfigNotReady
+				}
 			}
 			ch.needsConfigResume = false
 			return nil

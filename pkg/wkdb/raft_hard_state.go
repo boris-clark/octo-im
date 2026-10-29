@@ -29,7 +29,11 @@ func (wk *wukongDB) SaveRaftHardState(shardNo string, state types.HardState) err
 		if err != nil {
 			return err
 		}
-		if state.CommittedFloor > uint64(msg.MessageSeq) {
+		barrier, err := wk.LastChannelNoop(shardNo)
+		if err != nil {
+			return err
+		}
+		if state.CommittedFloor > max(uint64(msg.MessageSeq), barrier.Index) {
 			return fmt.Errorf("commit floor beyond stored channel tail")
 		}
 	}
