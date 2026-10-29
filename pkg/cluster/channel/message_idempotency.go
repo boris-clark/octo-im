@@ -160,9 +160,13 @@ func (s *Server) proposeMessages(ctx context.Context, id string, typ uint8, reqs
 				}
 				proposed = true
 			}
-			if _, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()}); err != nil {
+			recoveryIndex, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
+			if err != nil {
 				return err
 			}
+			// A legacy applied index cannot satisfy the wait for the fresh
+			// recovery entry. Certify the message only after that entry applies.
+			maxIndex = max(maxIndex, recoveryIndex)
 			return nil
 		})
 	}

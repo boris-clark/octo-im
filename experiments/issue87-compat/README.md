@@ -48,6 +48,13 @@ three production channel servers with unchanged three-voter membership over
 in-process event transport, requires a new committed/applied proposal on every
 node, reopens and checks retained content and progress. A one-voter fixture
 covers a real current-term barrier and the resulting message sequence gap.
+The `applied-tail` profile also restores a same-term applied-only tail on three
+voters. Activation admits a fresh recovery entry beyond that tail, without
+blocking the other voters from initializing. A partitioned retry cannot publish
+a floor. After quorum returns, the retry waits for the actual barrier apply,
+returns the original message identity, and is followed by a new proposal and
+restart. Config recovery retains its target through caller cancellation, and
+duplicate sends also wait when a durable floor is ahead of application.
 Lagging and divergent stores are checked for retained data and no inferred
 floor; these are read/reopen diagnostics, not automatic historical repair.
 A missing-quorum proposal must leave the durable floor and applied index

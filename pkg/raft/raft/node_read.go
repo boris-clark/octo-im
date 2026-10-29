@@ -29,14 +29,29 @@ func (n *Node) ResumeReplication() {
 
 // ResumeReplicationWithEntry admits a current-term barrier when a retained
 // suffix cannot yet be committed. The caller must wait for the returned index
-// to commit; admission alone is never proof of storage or commitment.
+// to commit and apply; admission alone is never proof of either completion.
 // Call on the owner, using an entry supported by the group's storage adapter.
 func (n *Node) ResumeReplicationWithEntry(entry types.Log) (uint64, error) {
 	if !n.LeaderReadReady() {
 		return 0, errors.New("raft: recovery leader is not ready")
 	}
+	// Legacy applied progress has no authenticated commit floor. Even when
+	// the retained tail has this term, use a fresh entry beyond that progress
+	// so recovery can observe a real store, quorum commit and apply completion.
+	if n.opts.SaveHardState != nil && n.queue.appliedIndex > n.CommittedIndex() && n.queue.storedIndex <= n.queue.appliedIndex {
+		n.KeepAlive()
+		n.sendNotifySync(All)
+		if logs := n.queue.logs; len(logs) > 0 && logs[len(logs)-1].Term == n.cfg.Term {
+			return n.LastLogIndex(), nil
+		}
+		admission, err := n.Admit([]types.Log{entry})
+		return admission.LastIndex, err
+	}
 	n.ResumeReplication()
 	if n.LastLogIndex() <= n.CommittedIndex() {
+		if n.AppliedIndex() < n.CommittedIndex() {
+			return n.CommittedIndex(), nil
+		}
 		return 0, nil
 	}
 	if n.LastLogTerm() == n.cfg.Term {

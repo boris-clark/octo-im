@@ -71,7 +71,7 @@ func main() {
 	if *root == "" || *output == "" {
 		panic("root and report are required")
 	}
-	if *profile != "normal" && *profile != "lagging" && *profile != "divergent" && *profile != "maximum" && *profile != "damaged" && *profile != "single" && *profile != "malformed" {
+	if *profile != "normal" && *profile != "lagging" && *profile != "divergent" && *profile != "maximum" && *profile != "damaged" && *profile != "single" && *profile != "malformed" && *profile != "applied-tail" {
 		panic("unknown profile")
 	}
 	marker := filepath.Join(*root, "DISPOSABLE-ISSUE87-FIXTURE")
@@ -148,6 +148,9 @@ func main() {
 				check(db.SetLeaderTermStartIndex(k, math.MaxUint32, 4))
 			}
 			applied := uint64(2)
+			if *profile == "applied-tail" {
+				applied = uint64(tail)
+			}
 			if *profile == "lagging" {
 				applied = 1
 			}

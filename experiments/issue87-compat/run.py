@@ -59,7 +59,8 @@ def main():
     fixtures = output / 'fixtures'
     fixtures.mkdir()
     for name, profile in [('node1','normal'), ('node2','normal'), ('node3','normal'),
-                          ('single','single'), ('lagging','lagging'), ('divergent','divergent'), ('malformed','malformed'),('noquorum','normal')]:
+                          ('single','single'), ('lagging','lagging'), ('divergent','divergent'), ('malformed','malformed'),('noquorum','normal'),
+                          ('retry1','applied-tail'), ('retry2','applied-tail'), ('retry3','applied-tail')]:
         root = fixtures / name
         root.mkdir()
         run('old-create-'+name, [str(binary), '-root', str(root), '-profile', profile,

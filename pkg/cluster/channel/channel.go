@@ -25,6 +25,8 @@ type Channel struct {
 	channelKey string
 	// Owned by rg.Do; retained if the caller expires between Step and Ready.
 	needsConfigResume bool
+	// Recovery admission survives caller cancellation until its real apply.
+	configResumeIndex uint64
 }
 
 func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftGroup) (*Channel, error) {
@@ -139,19 +141,32 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 			if r != ch {
 				return raftgroup.ErrRaftNotExist
 			}
-			if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+			if ch.needsConfigResume && ch.IsLeader() {
 				if !ch.LeaderReadReady() {
 					return ErrConfigNotReady
 				}
-				index, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
-				if err != nil {
-					return err
-				}
-				if ch.CommittedIndex() < index {
-					return ErrConfigNotReady
+				// An ordinary already-committed apply may itself call applyConfig;
+				// only wait here for recovery that this config actually admitted.
+				singleVoter := len(ch.Config().Replicas) == 1
+				appliedOnlyTail := ch.AppliedIndex() > ch.CommittedIndex() && ch.LastLogIndex() <= ch.AppliedIndex()
+				if singleVoter && ch.LastLogIndex() > ch.CommittedIndex() || appliedOnlyTail || ch.configResumeIndex > 0 {
+					index, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
+					if err != nil {
+						return err
+					}
+					ch.configResumeIndex = max(ch.configResumeIndex, index)
+					if ch.CommittedIndex() < ch.configResumeIndex || ch.AppliedIndex() < ch.configResumeIndex {
+						// Other voters must be able to initialize before a quorum
+						// exists. Retain the target; foreground sends still wait.
+						if !singleVoter {
+							return nil
+						}
+						return ErrConfigNotReady
+					}
 				}
 			}
 			ch.needsConfigResume = false
+			ch.configResumeIndex = 0
 			return nil
 		})
 		if !errors.Is(err, ErrConfigNotReady) {
