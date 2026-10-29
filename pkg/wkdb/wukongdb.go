@@ -24,13 +24,14 @@ import (
 var _ DB = (*wukongDB)(nil)
 
 type wukongDB struct {
-	raftLocks [128]sync.Mutex
-	dbs       []*pebble.DB
-	wkdbs     []*BatchDB
-	shardNum  uint32 // 分区数量，这个一但设置就不能修改
-	opts      *Options
-	sync      *pebble.WriteOptions
-	endian    binary.ByteOrder
+	logMetadataMu sync.Mutex // Serializes canonical metadata adoption and log/term mutations.
+	raftLocks     [128]sync.Mutex
+	dbs           []*pebble.DB
+	wkdbs         []*BatchDB
+	shardNum      uint32 // 分区数量，这个一但设置就不能修改
+	opts          *Options
+	sync          *pebble.WriteOptions
+	endian        binary.ByteOrder
 	wklog.Log
 	prmaryKeyGen *snowflake.Node // 消息ID生成器
 	noSync       *pebble.WriteOptions

@@ -75,6 +75,7 @@ type MessageDB interface {
 
 	// AppendMessages appends messages to the db.
 	AppendMessages(channelId string, channelType uint8, msgs []Message) error
+	AppendMessagesWithTerm(channelId string, channelType uint8, msgs []Message, term *types.TermStartIndexInfo) error
 
 	// LoadPrevRangeMsgs 向上加载指定范围的消息 end=0表示不做限制 比如 start=100 end=0 limit=10 则返回的消息seq为91-100的消息, 比如 start=100 end=95 limit=10 则返回的消息seq为96-100的消息
 	// 结果包含start,不包含end

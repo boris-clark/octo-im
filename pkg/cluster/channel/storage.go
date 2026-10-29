@@ -3,6 +3,7 @@ package channel
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -129,6 +130,9 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 
 	messages := make([]wkdb.Message, len(logs))
 	for i, log := range logs {
+		if log.Index == 0 || log.Index > math.MaxUint32 || log.Term == 0 {
+			return fmt.Errorf("channel log index or term out of range")
+		}
 		if types.IsNoop(log) {
 			continue
 		}
@@ -142,13 +146,25 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 		msg.Term = uint64(log.Term)
 		messages[i] = msg
 	}
+	if termStartIndexInfo != nil {
+		matched := false
+		for _, log := range logs {
+			if log.Index == termStartIndexInfo.Index && log.Term == termStartIndexInfo.Term {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("term boundary is outside channel append")
+		}
+	}
 	// Preserve a durable prefix across partial failures: a later message must
 	// never become the recovered tail before its preceding barrier is stored.
 	start := 0
 	for i, log := range logs {
 		if types.IsNoop(log) {
 			if start < i {
-				if err := s.db.AppendMessages(channelId, channelType, messages[start:i]); err != nil {
+				if err := s.appendMessages(channelId, channelType, messages[start:i], termStartIndexInfo); err != nil {
 					return err
 				}
 			}
@@ -159,23 +175,24 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 		}
 	}
 	if start < len(logs) {
-		if err := s.db.AppendMessages(channelId, channelType, messages[start:]); err != nil {
+		if err := s.appendMessages(channelId, channelType, messages[start:], termStartIndexInfo); err != nil {
 			return err
 		}
 	}
-	if termStartIndexInfo != nil {
-		// A barrier publishes its term row in the same synced batch.
-		for _, log := range logs {
-			if types.IsNoop(log) && log.Index == termStartIndexInfo.Index && log.Term == termStartIndexInfo.Term {
-				return nil
+
+	return nil
+}
+
+// Each message segment publishes its term boundary in the same synced batch.
+func (s *storage) appendMessages(id string, typ uint8, messages []wkdb.Message, term *types.TermStartIndexInfo) error {
+	if term != nil {
+		for _, msg := range messages {
+			if uint64(msg.MessageSeq) == term.Index && uint32(msg.Term) == term.Term {
+				return s.db.AppendMessagesWithTerm(id, typ, messages, term)
 			}
 		}
-		err := s.db.SetLeaderTermStartIndex(key, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
-			return err
-		}
 	}
-	return nil
+	return s.db.AppendMessages(id, typ, messages)
 }
 
 func (s *storage) GetTermStartIndex(key string, term uint32) (uint64, error) {

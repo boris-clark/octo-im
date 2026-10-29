@@ -29,6 +29,13 @@ func (d *recoveryBarrierDB) AppendMessages(id string, typ uint8, messages []wkdb
 	return d.DB.AppendMessages(id, typ, messages)
 }
 
+func (d *recoveryBarrierDB) AppendMessagesWithTerm(id string, typ uint8, messages []wkdb.Message, term *types.TermStartIndexInfo) error {
+	if d.failMessages.Load() {
+		return errors.New("injected message sync failure")
+	}
+	return d.DB.AppendMessagesWithTerm(id, typ, messages, term)
+}
+
 func (d *recoveryBarrierDB) AppendChannelNoop(key string, log types.Log) error {
 	if d.failStore.Load() {
 		return errors.New("injected barrier sync failure")

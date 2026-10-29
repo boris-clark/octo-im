@@ -1180,3 +1180,22 @@ func NewChannelNoopKey(shardNo string, index uint64) []byte {
 	binary.BigEndian.PutUint64(k[6+len(shardNo):], index)
 	return k
 }
+
+// NewChannelTermPrefix identifies canonical term rows by the complete channel key.
+func NewChannelTermPrefix(shardNo string) []byte {
+	k := make([]byte, 8+len(shardNo))
+	copy(k, []byte{0x1B, 0x03, dataTypeOther, 0})
+	binary.BigEndian.PutUint32(k[4:], uint32(len(shardNo)))
+	copy(k[8:], shardNo)
+	return k
+}
+
+// NewChannelTermKey addresses one canonical term boundary.
+func NewChannelTermKey(shardNo string, term uint32) []byte {
+	return binary.BigEndian.AppendUint32(NewChannelTermPrefix(shardNo), term)
+}
+
+// NewChannelLogLayoutKey marks complete adoption for the full channel identity.
+func NewChannelLogLayoutKey(shardNo string) []byte {
+	return append([]byte{0x1B, 0x04, dataTypeOther, 0}, []byte(shardNo)...)
+}
