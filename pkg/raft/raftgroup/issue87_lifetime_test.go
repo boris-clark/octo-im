@@ -12,6 +12,58 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestIssue87DetachRetainsOwnershipThroughReceiptCleanup(t *testing.T) {
+	g := New(NewOptions(WithStorage(&memStorage{}), WithTransport(dropTransport{})))
+	old := issue87Node(admKey, 0, 0)
+	fresh := issue87Node(admKey, 0, 0)
+	require.NoError(t, g.AddRaft(old))
+	defer func() {
+		g.Stop()
+		require.NoError(t, g.WaitQuiescence(context.Background()))
+		g.goPool.Release()
+	}()
+
+	// Hold actual receipt cleanup after detachment. A replacement must be
+	// refused while the old key-wide cleanup can still affect its waiters.
+	bucket := g.wait.bucket(admKey)
+	bucket.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			bucket.mu.Unlock()
+		}
+	}()
+	removed := make(chan struct{})
+	go func() { g.RemoveRaft(old); close(removed) }()
+	waitFor(t, "old instance detached", func() bool { return g.GetRaft(admKey) == nil })
+	added := make(chan error, 1)
+	go func() { added <- g.AddRaft(fresh) }()
+	var addErr error
+	returned := false
+	select {
+	case addErr = <-added:
+		returned = true
+	case <-time.After(100 * time.Millisecond):
+		t.Error("replacement must refuse until detached receipt cleanup finishes")
+	}
+	bucket.mu.Unlock()
+	locked = false
+	<-removed
+	if !returned {
+		addErr = <-added
+	}
+	require.ErrorIs(t, addErr, ErrRaftBusy)
+	require.NoError(t, g.AddRaft(fresh))
+	w, _ := g.wait.register(receipt{lease: g.raftStorageLease(fresh), raftKey: admKey, seq: 200, term: 1, first: 1, last: 1, logs: []types.Log{{Id: 200, Index: 1}}})
+	g.RemoveRaft(old)
+	select {
+	case <-w.doneC:
+		t.Fatal("stale retirement cleanup settled a replacement receipt")
+	default:
+	}
+	require.Same(t, fresh, g.GetRaft(admKey))
+}
+
 func issue87Pending(g *RaftGroup) (effects, dispositions int) {
 	g.storageMu.Lock()
 	defer g.storageMu.Unlock()

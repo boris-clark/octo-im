@@ -152,8 +152,16 @@ func (rg *RaftGroup) removeRaft(r IRaft) {
 		return
 	}
 	lease.retired = true
+	// Key-wide receipt and admission cleanup still belongs to this instance.
+	// Keep replacement fenced until that cleanup and its callback return.
+	lease.pending++
 	rg.raftList.remove(r.Key())
 	rg.storageMu.Unlock()
+	defer func() {
+		rg.storageMu.Lock()
+		lease.pending--
+		rg.storageMu.Unlock()
+	}()
 	rg.wait.removeKey(r.Key(), proposalOutcomeUnknown(ErrRaftNotExist))
 	rg.admissionSems.Delete(r.Key())
 	if rg.opts.Event != nil {
