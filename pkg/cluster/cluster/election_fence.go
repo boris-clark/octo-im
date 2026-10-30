@@ -73,6 +73,14 @@ func (r *rpcServer) handleElectionFence(c *wkserver.Context) {
 }
 
 func (s *Server) requestElectionFences(ctx context.Context, cfg rt.Config, req electionFenceRequest) (map[uint64]rt.ElectionReport, error) {
+	targets := append([]uint64(nil), cfg.Replicas...)
+	if req.IncludeLearners {
+		targets = append(targets, cfg.Learners...)
+	}
+	return s.requestElectionFencesFrom(ctx, cfg, req, targets)
+}
+
+func (s *Server) requestElectionFencesFrom(ctx context.Context, cfg rt.Config, req electionFenceRequest, targets []uint64) (map[uint64]rt.ElectionReport, error) {
 	if cfg.Term == math.MaxUint32 {
 		return nil, errors.New("election term exhausted")
 	}
@@ -90,10 +98,6 @@ func (s *Server) requestElectionFences(ctx context.Context, cfg rt.Config, req e
 	var mu sync.Mutex
 	var group errgroup.Group
 	seen := make(map[uint64]bool)
-	targets := append([]uint64(nil), cfg.Replicas...)
-	if req.IncludeLearners {
-		targets = append(targets, cfg.Learners...)
-	}
 	for _, id := range targets {
 		if id == 0 || seen[id] {
 			continue

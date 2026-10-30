@@ -15,6 +15,9 @@ func TestAppliedProgressSnapshotDuringActualApply(t *testing.T) {
 	require.NoError(t, err)
 	var readers sync.WaitGroup
 	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopReaders := func() { stopOnce.Do(func() { close(stop) }); readers.Wait() }
+	defer stopReaders()
 	readers.Add(1)
 	go func() {
 		defer readers.Done()
@@ -34,8 +37,7 @@ func TestAppliedProgressSnapshotDuringActualApply(t *testing.T) {
 	for i := uint32(1); i <= 100; i++ {
 		require.NoError(t, s.applyLog(types.Log{Index: uint64(i), Term: i, Data: data}))
 	}
-	close(stop)
-	readers.Wait()
+	stopReaders()
 	require.EqualValues(t, 100, s.GetClusterConfig().Version)
 }
 

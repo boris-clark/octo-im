@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	rt "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/stretchr/testify/require"
 )
@@ -85,4 +86,14 @@ func TestE3SlotReplicaHTTPDuringTransferAndAfterStop(t *testing.T) {
 	}, time.Second, 5*time.Millisecond)
 	require.NoError(t, c.servers[to].Stop())
 	require.Equal(t, http.StatusBadRequest, read(to).Code, "stopped replica must refuse before touching closed storage")
+}
+
+func TestE3SlotBarrierLogRemainsReadable(t *testing.T) {
+	for _, id := range []uint64{0, 5001} {
+		log, err := NewLogRespFromLog(rt.Log{Index: 12, Term: 3, Id: id, Data: rt.NoopData()}, LogTypeSlot)
+		require.NoError(t, err)
+		require.Equal(t, "Noop", log.Cmd)
+		require.EqualValues(t, 12, log.Index)
+		require.EqualValues(t, 3, log.Term)
+	}
 }

@@ -1,6 +1,7 @@
 package clusterconfig
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -39,6 +40,17 @@ func (s *Server) ProposeSlotInstall(expected, next *pb.Slot) error {
 }
 
 func (s *Server) ProposeSlotInstallWithMembership(expected, next *pb.Slot, cert *rt.MembershipCertificate) error {
+	return s.proposeSlotInstall(expected, next, cert, s.ProposeUntilApplied)
+}
+
+// ProposeSlotInstallWithMembershipContext retains the caller's fencing budget.
+func (s *Server) ProposeSlotInstallWithMembershipContext(ctx context.Context, expected, next *pb.Slot, cert *rt.MembershipCertificate) error {
+	return s.proposeSlotInstall(expected, next, cert, func(id uint64, data []byte) (*rt.ProposeResp, error) {
+		return s.ProposeUntilAppliedTimeout(ctx, id, data)
+	})
+}
+
+func (s *Server) proposeSlotInstall(expected, next *pb.Slot, cert *rt.MembershipCertificate, propose func(uint64, []byte) (*rt.ProposeResp, error)) error {
 	data, err := json.Marshal(slotInstall{Expected: expected.Clone(), Next: next.Clone(), Membership: cert})
 	if err != nil {
 		return err
@@ -48,7 +60,7 @@ func (s *Server) ProposeSlotInstallWithMembership(expected, next *pb.Slot, cert 
 	if err != nil {
 		return err
 	}
-	_, proposalErr := s.ProposeUntilApplied(s.genConfigId(), b)
+	_, proposalErr := propose(s.genConfigId(), b)
 	current := s.AppliedSlot(expected.Id)
 	if current != nil && proto.Equal(current, next) {
 		return nil

@@ -57,14 +57,38 @@ func (s *Server) certifySlotMembership(ctx context.Context, old, next *pb.Slot) 
 		return nil, raft.ErrConfigVersionStale
 	}
 	term := old.Term + 1
-	reports, err := s.requestElectionFences(ctx, slotElectionConfig(old), electionFenceRequest{
-		Slot:            old,
-		Term:            term,
-		IncludeLearners: true,
-	})
+	cfg := slotElectionConfig(old)
+	req := electionFenceRequest{Slot: old, Term: term}
+	var promoted []uint64
+	for _, id := range next.Replicas {
+		if !slices.Contains(old.Replicas, id) {
+			promoted = append(promoted, id)
+		}
+	}
+	witnesses := make(map[uint64]rt.ElectionReport)
+	if len(promoted) > 0 {
+		var err error
+		witnesses, err = s.requestElectionFencesFrom(ctx, cfg, req, promoted)
+		if err != nil {
+			return nil, err
+		}
+		identity := rt.ElectionIdentity(cfg)
+		for _, id := range promoted {
+			r, ok := witnesses[id]
+			if !ok || r.Identity != identity || r.NodeID != id || !r.Fenced || r.Term != term {
+				return nil, errors.New("promoted slot learner did not acknowledge its fence")
+			}
+		}
+	}
+	// Do not stop an old quorum before every promoted learner acknowledges.
+	reports, err := s.requestElectionFences(ctx, cfg, req)
 	if err != nil {
 		return nil, err
 	}
+	for id, r := range witnesses {
+		reports[id] = r
+	}
+
 	next.Term = term
 	next.InstalledTerm = term
 	next.ExpectLeader = 0
@@ -77,7 +101,7 @@ func (s *Server) certifySlotMembership(ctx context.Context, old, next *pb.Slot) 
 	}
 	cert := &rt.MembershipCertificate{Reports: reports}
 	if err := rt.ValidateMembershipInstall(slotElectionConfig(old), slotElectionConfig(next), cert); err != nil {
-		return nil, err
+		return nil, errors.Join(err, s.resumeSlotAfterRejectedMembership(ctx, old, term, reports))
 	}
 	selected, err := rt.SelectFencedLeader(slotElectionConfig(old), term, reports)
 	if err != nil {
@@ -88,7 +112,7 @@ func (s *Server) certifySlotMembership(ctx context.Context, old, next *pb.Slot) 
 		if !slices.Contains(old.Replicas, id) {
 			r, ok := reports[id]
 			if !ok || !r.Fenced || r.Term != term || r.LastIndex != tail.LastIndex || r.LastTerm != tail.LastTerm {
-				return nil, errors.New("promoted slot learner has not stored selected history")
+				return nil, errors.Join(errors.New("promoted slot learner has not stored selected history"), s.resumeSlotAfterRejectedMembership(ctx, old, term, reports))
 			}
 		}
 	}
@@ -101,7 +125,7 @@ func (s *Server) installCertifiedSlotMembership(ctx context.Context, old, next *
 	if err != nil {
 		return err
 	}
-	return s.cfgServer.ProposeSlotInstallWithMembership(old, candidate, cert)
+	return s.cfgServer.ProposeSlotInstallWithMembershipContext(ctx, old, candidate, cert)
 }
 
 func (s *Server) slotNodeLogInfo(ctx context.Context, nodeId uint64, slotId uint32) (SlotInfo, bool) {
@@ -345,4 +369,35 @@ func (s *Server) slotMigrationLoop() {
 			cancel()
 		}
 	}
+}
+
+// resumeSlotAfterRejectedMembership restores service using the unchanged voter
+// set after a rejected promotion has already fenced the old term. It requires
+// actual old-voter reports and preserves their selected committed history.
+func (s *Server) resumeSlotAfterRejectedMembership(ctx context.Context, old *pb.Slot, term uint32, reports map[uint64]rt.ElectionReport) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	cfg := slotElectionConfig(old)
+	identity := rt.ElectionIdentity(cfg)
+	valid := make(map[uint64]rt.ElectionReport)
+	for id, r := range reports {
+		if r.Identity == identity && r.NodeID == id && r.Fenced && r.Term == term {
+			valid[id] = r
+		}
+	}
+	leader, err := rt.SelectFencedLeader(cfg, term, valid)
+	if err != nil {
+		return err
+	}
+	next := old.Clone()
+	next.Leader = leader
+	next.Term = term
+	next.InstalledTerm = term
+	next.Status = pb.SlotStatus_SlotStatusNormal
+	next.ExpectLeader = 0
+	for _, r := range valid {
+		next.BoundaryTerm = max(next.BoundaryTerm, r.BoundaryTerm)
+	}
+	return s.cfgServer.ProposeSlotInstallWithMembershipContext(ctx, old, next, nil)
 }
