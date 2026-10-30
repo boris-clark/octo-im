@@ -76,6 +76,7 @@ type Server struct {
 	channelKeyLock *keylock.KeyLock // 频道锁
 	// channelInstallLock serializes local fence-to-publication decisions only.
 	channelInstallLock *ringlock.RingLock
+	slotMigrateNotify  chan struct{}
 
 	sync.Mutex
 }
@@ -87,6 +88,7 @@ func New(opts *Options) *Server {
 		Log:                wklog.NewWKLog("cluster"),
 		channelKeyLock:     keylock.NewKeyLock(),
 		channelInstallLock: ringlock.NewRingLock(1024),
+		slotMigrateNotify:  make(chan struct{}, 1),
 		uptime:             time.Now(),
 		stopper:            syncutil.NewStopper(),
 	}
@@ -138,6 +140,7 @@ func New(opts *Options) *Server {
 
 	// 节点分布式配置服务
 	s.cfgServer = clusterconfig.New(opts.ConfigOptions)
+	s.cfgServer.SetOnProposeMigrateSlot(s.proposeMigrateSlot)
 
 	//节点事件服务
 	s.eventServer = event.NewServer(s, opts.ConfigOptions, s.cfgServer)
@@ -260,6 +263,7 @@ func (s *Server) Start() error {
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
 	}
+	s.stopper.RunWorker(s.slotMigrationLoop)
 	s.channelConfigReconciler().start()
 
 	return nil
@@ -413,6 +417,12 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 	if r := s.channelConfigReconciler(); r != nil {
 		r.rescan()
 	}
+	for _, st := range cfg.Slots {
+		if st != nil && (st.MigrateFrom != 0 || st.MigrateTo != 0 || len(st.Learners) > 0) {
+			s.notifySlotMigration()
+			break
+		}
+	}
 
 	nodeMap := make(map[uint64]string)
 	for _, node := range cfg.Nodes {
@@ -489,6 +499,12 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 	if slot == nil {
 		s.Error("slot not found", zap.Uint32("slotId", slotId))
 		return errors.New("slot not found")
+	}
+	if slot.InstalledTerm != 0 {
+		s.notifySlotMigration()
+		ctx, cancel := context.WithTimeout(s.cancelCtx, 3*time.Second)
+		defer cancel()
+		return s.tryCompleteSlotMigration(ctx, slotId)
 	}
 	cloneSlot := slot.Clone()
 	// 更新slot的配置

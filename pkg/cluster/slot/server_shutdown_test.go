@@ -56,28 +56,28 @@ func (s *verifyGateStorage) note(v string) {
 	s.mu.Unlock()
 }
 
-func (s *verifyGateStorage) GetLogs(key string, start, end, limit uint64) ([]types.Log, error) {
+func (s *verifyGateStorage) BoundGetLogs(key string, start, end, limit uint64) ([]types.Log, error) {
 	done := s.track("GetLogs")
 	if limit == 0 && end == start+1 && s.armed.CompareAndSwap(true, false) {
 		s.reads.Add(1)
 		close(s.entered)
 		<-s.release
 	}
-	logs, err := s.PebbleShardLogStorage.GetLogs(key, start, end, limit)
+	logs, err := s.PebbleShardLogStorage.BoundGetLogs(key, start, end, limit)
 	done(err)
 	return logs, err
 }
 
-func (s *verifyGateStorage) AppendLogs(key string, logs []types.Log, info *types.TermStartIndexInfo) error {
+func (s *verifyGateStorage) BoundAppendLogs(key string, logs []types.Log, info *types.TermStartIndexInfo) error {
 	done := s.track("AppendLogs")
-	err := s.PebbleShardLogStorage.AppendLogs(key, logs, info)
+	err := s.PebbleShardLogStorage.BoundAppendLogs(key, logs, info)
 	done(err)
 	return err
 }
 
-func (s *verifyGateStorage) Apply(key string, logs []types.Log) error {
+func (s *verifyGateStorage) BoundApply(key string, logs []types.Log) error {
 	done := s.track("Apply")
-	err := s.PebbleShardLogStorage.Apply(key, logs)
+	err := s.PebbleShardLogStorage.BoundApply(key, logs)
 	done(err)
 	s.once.Do(func() { close(s.applied) })
 	return err
@@ -204,7 +204,7 @@ func TestSlotServerStopJoinsVerificationBeforeClose(t *testing.T) {
 	require.ErrorIs(t, r.err, raftgroup.ErrGroupStopped)
 	require.False(t, gate.closed.Load())
 	// Ownership is retained: storage is still open and usable.
-	_, err = follower.storage.GetLogs("1", 1, 2, 0)
+	_, err = follower.storage.getLogs("1", 1, 2, 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, gate.inflight.Load(), "only the blocked verification read remains")
 
@@ -262,7 +262,7 @@ func TestSlotServerStopBoundsBlockedHardState(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(gate.release) }) }
 	t.Cleanup(release)
-	save := gate.wrap(func(st types.HardState) error { return s.storage.SaveHardState("1", st) })
+	save := gate.wrap(func(st types.HardState) error { return s.storage.saveHardState("1", st) })
 	node := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithKey("1"), raft.WithNodeId(1), raft.WithReplicas([]uint64{1}), raft.WithSaveHardState(save)))
 	s.raftGroup.AddRaft(node)
 	require.NoError(t, s.raftGroup.Start())
@@ -284,7 +284,7 @@ func TestSlotServerStopBoundsBlockedHardState(t *testing.T) {
 		t.Logf("bounded handoff %d returned after %s: %v", i+1, elapsed, err)
 	}
 	// Ownership is retained: storage is still open and usable.
-	_, err := s.storage.GetState("1")
+	_, err := s.storage.getState("1")
 	require.NoError(t, err)
 	select {
 	case <-s.stopDone:

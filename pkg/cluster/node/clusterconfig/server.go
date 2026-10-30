@@ -63,10 +63,15 @@ type Server struct {
 	listeners         []IEvent // 事件监听器
 	// Apply-worker-only progress. On restart the persisted snapshot and
 	// initRaft reconstruct membership; these flags cover in-process retries.
-	membershipPending   bool
-	configSavePending   bool
-	configNotifyPending bool
+	membershipPending    bool
+	configSavePending    bool
+	configNotifyPending  bool
+	onProposeMigrateSlot func(slotId uint32, fromNodeId, toNodeId uint64) error
 	wklog.Log
+}
+
+func (s *Server) SetOnProposeMigrateSlot(fn func(slotId uint32, fromNodeId, toNodeId uint64) error) {
+	s.onProposeMigrateSlot = fn
 }
 
 func New(opts *Options) *Server {

@@ -3,6 +3,7 @@ package slot
 import (
 	"context"
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
@@ -10,16 +11,39 @@ import (
 // FenceElection persists on the existing owner before sampling actual stored entries.
 func (s *Server) FenceElection(ctx context.Context, expected *pb.Slot, term uint32) (types.ElectionReport, error) {
 	var report types.ElectionReport
-	err := s.raftGroup.Do(ctx, SlotIdToKey(expected.Id), func(r raftgroup.IRaft) error {
+	key := SlotIdToKey(expected.Id)
+	err := s.raftGroup.Do(ctx, key, func(r raftgroup.IRaft) error {
+		if r == nil {
+			return raftgroup.ErrRaftNotExist
+		}
 		st := r.(*Slot)
-		if err := st.Node.FenceElection(s.slotToConfig(expected), term); err != nil {
+		cfg := s.slotToConfig(expected)
+		if !st.PendingElectionFence() && !raft.SameElectionIdentity(st.Node.Config(), cfg) && cfg.Term >= st.Node.Config().Term {
+			if err := st.Node.Step(types.Event{Type: types.ConfChange, Config: cfg}); err != nil {
+				return err
+			}
+		}
+		if err := st.Node.FenceElection(cfg, term); err != nil {
 			return err
 		}
-		state, err := s.storage.GetState(SlotIdToKey(expected.Id))
-		if err != nil {
+		var state types.RaftState
+		if err := s.raftGroup.WithInstanceStorageLease(st, func() error {
+			var err error
+			state, err = s.storage.BoundGetState(key)
+			return err
+		}); err != nil {
 			return err
 		}
-		report = types.ElectionReport{NodeID: s.opts.NodeId, Term: term, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor, BoundaryTerm: state.HardState.BoundaryTerm, Fenced: state.HardState.FenceTerm == term && state.HardState.InstalledTerm < term && !state.Diverged}
+		report = types.ElectionReport{
+			NodeID:       s.opts.NodeId,
+			Term:         term,
+			Identity:     types.ElectionIdentity(cfg),
+			LastIndex:    state.LastLogIndex,
+			LastTerm:     state.LastTerm,
+			Floor:        state.HardState.CommittedFloor,
+			BoundaryTerm: state.HardState.BoundaryTerm,
+			Fenced:       state.HardState.FenceTerm == term && state.HardState.InstalledTerm < term && !state.Diverged,
+		}
 		return nil
 	})
 	return report, err

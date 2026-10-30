@@ -72,6 +72,9 @@ func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func(
 		rg.storageMu.Lock()
 		stopped := rg.stopBegun.Load()
 		valid := !stopped && rg.storageLeases[key] == lease && current == nil
+		if valid {
+			lease.initializing = candidate
+		}
 		rg.storageMu.Unlock()
 		if stopped {
 			return ErrGroupStopped
@@ -81,6 +84,9 @@ func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func(
 		}
 		if initialize != nil {
 			if err := initialize(candidate); err != nil {
+				rg.storageMu.Lock()
+				lease.initializing = nil
+				rg.storageMu.Unlock()
 				return err
 			}
 		}
@@ -88,10 +94,12 @@ func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func(
 		// fence here, so activation compares under the same registry lock.
 		rg.storageMu.Lock()
 		if rg.stopBegun.Load() {
+			lease.initializing = nil
 			rg.storageMu.Unlock()
 			return ErrGroupStopped
 		}
 		rg.wait.removeKey(key, proposalOutcomeUnknown(ErrRaftNotExist))
+		lease.initializing = nil
 		lease.raft = candidate
 		rg.raftList.push(candidate)
 		installed = true

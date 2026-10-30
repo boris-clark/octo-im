@@ -48,11 +48,11 @@ func issue87Open(t *testing.T, path string) *PebbleShardLogStorage {
 func issue87Build(t *testing.T, p *PebbleShardLogStorage, id uint64, voters []uint64) *raft.Node {
 	t.Helper()
 	key := SlotIdToKey(1)
-	state, err := p.GetState(key)
+	state, err := p.getState(key)
 	require.NoError(t, err)
-	row, err := p.GetTermStartIndex(key, state.LastTerm)
+	row, err := p.getTermStartIndex(key, state.LastTerm)
 	require.NoError(t, err)
-	n := raft.NewNode(row, state, raft.NewOptions(raft.WithKey(key), raft.WithNodeId(id), raft.WithReplicas(voters), raft.WithSaveHardState(func(h types.HardState) error { return p.SaveHardState(key, h) })))
+	n := raft.NewNode(row, state, raft.NewOptions(raft.WithKey(key), raft.WithNodeId(id), raft.WithReplicas(voters), raft.WithSaveHardState(func(h types.HardState) error { return p.saveHardState(key, h) })))
 	if id == 1 {
 		n.BecomeLeader(max(1, state.HardState.Term))
 	} else {
@@ -122,26 +122,26 @@ func TestIssue87PebbleCommitPublicationBarriers(t *testing.T) {
 		require.NoError(t, p.Close())
 	}()
 	issue87Await(t, before)
-	last, err := p.LastIndex(key)
+	last, err := p.lastIndex(key)
 	require.NoError(t, err)
 	require.Zero(t, last)
-	row, err := p.GetTermStartIndex(key, 1)
+	row, err := p.getTermStartIndex(key, 1)
 	require.NoError(t, err)
 	require.Zero(t, row)
 	require.ErrorIs(t, g.AddEventWait(key, types.Event{Type: types.StoreResp, Term: 100, Index: 1, Reason: types.ReasonOk}), raftgroup.ErrUnauthenticatedStorageResult)
 	issue87State(t, g, 0, 0, 0)
 	releaseCommit()
 	issue87Await(t, committed)
-	logs, err := p.GetLogs(key, 1, 2, 0)
+	logs, err := p.getLogs(key, 1, 2, 0)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	require.EqualValues(t, 99005, logs[0].Id)
 	require.Equal(t, []byte("durable-payload"), logs[0].Data)
-	row, err = p.GetTermStartIndex(key, 1)
+	row, err = p.getTermStartIndex(key, 1)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, row)
 	issue87State(t, g, 0, 0, 0)
-	diskApplied, err := p.AppliedIndex(key)
+	diskApplied, err := p.appliedIndex(key)
 	require.NoError(t, err)
 	require.Zero(t, diskApplied)
 	releaseDelivery()
@@ -151,11 +151,11 @@ func TestIssue87PebbleCommitPublicationBarriers(t *testing.T) {
 	require.NoError(t, g.WaitQuiescence(context.Background()))
 	require.NoError(t, p.Close())
 	p = issue87Open(t, path)
-	state, err := p.GetState(key)
+	state, err := p.getState(key)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, state.AppliedIndex)
 	require.EqualValues(t, 1, state.LastLogIndex)
-	logs, err = p.GetLogs(key, 1, 2, 0)
+	logs, err = p.getLogs(key, 1, 2, 0)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	require.EqualValues(t, 99005, logs[0].Id)
@@ -202,7 +202,7 @@ func TestIssue87ThreeNodeDurableCommitApplyRestart(t *testing.T) {
 			require.EqualValues(t, generation+1, responses[0].Index)
 			require.Eventually(t, func() bool {
 				for i, p := range stores {
-					index, err := p.AppliedIndex(key)
+					index, err := p.appliedIndex(key)
 					if err != nil || index != uint64(len(expected)) {
 						return false
 					}
@@ -214,7 +214,7 @@ func TestIssue87ThreeNodeDurableCommitApplyRestart(t *testing.T) {
 				return true
 			}, 3*time.Second, 5*time.Millisecond)
 			for i, p := range stores {
-				logs, err := p.GetLogs(key, 1, uint64(len(expected)+1), 0)
+				logs, err := p.getLogs(key, 1, uint64(len(expected)+1), 0)
 				require.NoError(t, err)
 				require.True(t, types.SameLogs(expected, logs), "replica %d generation %d identity mismatch: %+v", i, generation, logs)
 				var committed, applied uint64
@@ -226,7 +226,7 @@ func TestIssue87ThreeNodeDurableCommitApplyRestart(t *testing.T) {
 	}
 	for _, path := range paths {
 		p := issue87Open(t, path)
-		logs, err := p.GetLogs(key, 1, 3, 0)
+		logs, err := p.getLogs(key, 1, 3, 0)
 		require.NoError(t, err)
 		require.True(t, types.SameLogs(expected, logs))
 		require.True(t, bytes.Equal(expected[1].Data, logs[1].Data))
@@ -272,7 +272,7 @@ func TestIssue87PebbleAcceptedApplyDrainsBeforeReload(t *testing.T) {
 	var fresh raftgroup.IRaft
 	require.Eventually(t, func() bool { var err error; fresh, err = g.InitializeRaft(ctx, key, build, nil); return err == nil }, 3*time.Second, 5*time.Millisecond)
 	require.Equal(t, 1, reads)
-	state, err := p.GetState(key)
+	state, err := p.getState(key)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, state.AppliedIndex)
 	var oldApplied uint64
@@ -282,7 +282,7 @@ func TestIssue87PebbleAcceptedApplyDrainsBeforeReload(t *testing.T) {
 	responses, err := g.ProposeBatchUntilAppliedTimeout(ctx, key, types.ProposeReqSet{{Id: 200, Data: []byte("replacement")}})
 	require.NoError(t, err)
 	require.EqualValues(t, 2, responses[0].Index)
-	logs, err := p.GetLogs(key, 1, 3, 0)
+	logs, err := p.getLogs(key, 1, 3, 0)
 	require.NoError(t, err)
 	require.True(t, types.SameLogs([]types.Log{{Index: 1, Term: 1, Id: 100, Data: []byte("old-apply")}, {Index: 2, Term: 1, Id: 200, Data: []byte("replacement")}}, logs))
 }

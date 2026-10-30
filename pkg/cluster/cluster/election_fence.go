@@ -91,7 +91,7 @@ func (s *Server) requestElectionFences(ctx context.Context, cfg rt.Config, req e
 	var group errgroup.Group
 	seen := make(map[uint64]bool)
 	targets := append([]uint64(nil), cfg.Replicas...)
-	if req.Channel != nil && req.IncludeLearners {
+	if req.IncludeLearners {
 		targets = append(targets, cfg.Learners...)
 	}
 	for _, id := range targets {

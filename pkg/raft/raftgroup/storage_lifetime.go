@@ -10,14 +10,35 @@ import (
 // ErrRaftBusy means an attached or draining instance still owns this key.
 var ErrRaftBusy = errors.New("raftgroup: raft storage is still owned")
 
+// BoundStorage is implemented by storage backends whose raw exported methods
+// refuse unbound access and require an active RaftGroup lease, reservation, or
+// in-flight worker operation.
+type BoundStorage interface {
+	AttachStorageDomain(g *RaftGroup)
+	DetachStorageDomain(g *RaftGroup)
+	BoundGetState(key string) (types.RaftState, error)
+	BoundAppendLogs(key string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error
+	BoundTruncateLogTo(key string, index uint64) error
+	BoundGetLogs(key string, startLogIndex uint64, endLogIndex uint64, limitSize uint64) ([]types.Log, error)
+	BoundApply(key string, logs []types.Log) error
+	BoundSaveConfig(key string, cfg types.Config) error
+	BoundGetTermStartIndex(key string, term uint32) (uint64, error)
+	BoundLeaderLastLogTerm(key string) (uint32, error)
+	BoundLeaderTermGreaterEqThan(key string, term uint32) (uint32, error)
+	BoundDeleteLeaderTermStartIndexGreaterThanTerm(key string, term uint32) error
+	BoundMarkDiverged(key string, reason error) error
+	BoundSaveHardState(key string, state types.HardState) error
+}
+
 // A lease outlives detachment. Its operations retain the original owner until
 // both effects and terminal completion disposal have finished. Registry locks
 // never cover storage I/O, queue delivery, callbacks or owner joins.
 type raftLease struct {
-	storage IStorage
-	raft    IRaft
-	retired bool
-	pending int
+	storage      IStorage
+	raft         IRaft
+	initializing IRaft
+	retired      bool
+	pending      int
 }
 
 type storageOperation struct {
@@ -166,6 +187,135 @@ func (rg *RaftGroup) disposeStoppedStorage() {
 		op.disposed = true
 		rg.releaseStorageOperationLocked(op)
 	}
+	for _, lease := range rg.storageLeases {
+		lease.retired = true
+	}
+}
+
+// WithActiveStorageLease executes fn under the current active (installed and
+// non-retired) lease for key, holding a pending reference so replacement and
+// domain close wait for fn to return.
+func (rg *RaftGroup) WithActiveStorageLease(key string, fn func() error) error {
+	rg.storageMu.Lock()
+	if rg.stopBegun.Load() {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease := rg.storageLeases[key]
+	if lease == nil || lease.retired || lease.raft == nil {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease.pending++
+	rg.storageMu.Unlock()
+	defer func() {
+		rg.storageMu.Lock()
+		lease.pending--
+		rg.storageMu.Unlock()
+	}()
+	return fn()
+}
+
+// WithInitializingStorageLease executes fn while key holds an active
+// pre-install reservation created by InitializeRaft.
+func (rg *RaftGroup) WithInitializingStorageLease(key string, fn func() error) error {
+	rg.storageMu.Lock()
+	if rg.stopBegun.Load() {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease := rg.storageLeases[key]
+	if lease == nil || lease.retired || lease.raft != nil || lease.pending == 0 {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease.pending++
+	rg.storageMu.Unlock()
+	defer func() {
+		rg.storageMu.Lock()
+		lease.pending--
+		rg.storageMu.Unlock()
+	}()
+	return fn()
+}
+
+// WithInstanceStorageLease executes fn under the active lease of the specific
+// IRaft instance r, refusing if r has been retired or replaced by another
+// instance for the same key.
+func (rg *RaftGroup) WithInstanceStorageLease(r IRaft, fn func() error) error {
+	if r == nil {
+		return ErrRaftBusy
+	}
+	rg.storageMu.Lock()
+	if rg.stopBegun.Load() {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease := rg.storageLeases[r.Key()]
+	if lease == nil || lease.retired || (lease.raft != r && (lease.raft != nil || lease.pending == 0 || lease.initializing != r)) {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	lease.pending++
+	rg.storageMu.Unlock()
+	defer func() {
+		rg.storageMu.Lock()
+		lease.pending--
+		rg.storageMu.Unlock()
+	}()
+	return fn()
+}
+
+// HasInFlightStorageEffect reports whether key currently has an accepted worker
+// storageOperation whose effects have not yet completed, or an active/reserved
+// lease operation.
+func (rg *RaftGroup) HasInFlightStorageEffect(key string) bool {
+	rg.storageMu.Lock()
+	defer rg.storageMu.Unlock()
+	for op := range rg.storageOperations {
+		if op.key == key && !op.effectsDone {
+			return true
+		}
+	}
+	lease := rg.storageLeases[key]
+	return lease != nil && !lease.retired && !rg.stopBegun.Load()
+}
+
+// IsStorageQuiescent reports whether this RaftGroup has no running event loop,
+// no active or initializing leases, no pending lease operations, and no active
+// pool tasks.
+func (rg *RaftGroup) IsStorageQuiescent() bool {
+	rg.verificationMu.Lock()
+	started := rg.started.Load()
+	stopBegun := rg.stopBegun.Load()
+	loopJoined := rg.loopJoined
+	poolTasks := rg.poolTasks
+	rg.verificationMu.Unlock()
+
+	if started {
+		if !stopBegun || !loopJoined || poolTasks != 0 {
+			return false
+		}
+		select {
+		case <-rg.poolIdle:
+		default:
+			return false
+		}
+	} else if poolTasks != 0 {
+		return false
+	}
+
+	rg.storageMu.Lock()
+	defer rg.storageMu.Unlock()
+	if len(rg.storageOperations) != 0 {
+		return false
+	}
+	for _, lease := range rg.storageLeases {
+		if !lease.retired || lease.pending != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneStorageRequest(e types.Event) types.Event {

@@ -50,10 +50,11 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 			return newSlot(slot, s)
 		}, func(candidate raftgroup.IRaft) error {
 			st := candidate.(*Slot)
-			if st.PendingElectionFence() {
-				return st.RestoreElectionFence(s.slotToConfig(slot))
+			cfg := s.slotToConfig(slot)
+			if st.PendingElectionFence() && cfg.Term < st.Config().Term {
+				return st.RestoreElectionFence(cfg)
 			}
-			return candidate.Step(rafttype.Event{Type: rafttype.ConfChange, Config: s.slotToConfig(slot)})
+			return candidate.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg})
 		})
 		if err != nil {
 			s.Error("initialize slot failed", zap.Uint32("slotId", slot.Id), zap.Error(err))
@@ -61,10 +62,12 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 	} else { // 更新slot的分布式配置
 		raftSlot := rft.(*Slot)
 		if raftSlot.needUpdate(slot) {
+			raftSlot.slot = slot.Clone()
 			s.raftGroup.AddEvent(shardNo, rafttype.Event{
 				Type:   rafttype.ConfChange,
 				Config: s.slotToConfig(slot),
 			})
+			s.raftGroup.Advance()
 		}
 	}
 }

@@ -191,7 +191,7 @@ func writeDivergenceMarker(t *testing.T, dir string, slotId uint32) {
 	t.Helper()
 	storage := slot.NewPebbleShardLogStorage(nil, slot.SlotLogDBPath(path.Join(dir, "cluster")), uint32(slot.NewOptions().SlotDbShardNum))
 	require.NoError(t, storage.Open())
-	require.NoError(t, storage.MarkDiverged(slot.SlotIdToKey(slotId), rafttypes.ErrTruncateBelowApplied))
+	require.NoError(t, storage.ForTestFixture().MarkDiverged(slot.SlotIdToKey(slotId), rafttypes.ErrTruncateBelowApplied))
 	require.NoError(t, storage.Close())
 }
 

@@ -56,7 +56,7 @@ func newGapCluster(t *testing.T) *gapCluster {
 		require.NoError(t, disk.Open())
 		t.Cleanup(func() { require.NoError(t, disk.Close()) })
 		opts := raft.NewOptions(
-			raft.WithSaveHardState(func(st rafttype.HardState) error { return disk.SaveHardState("gap", st) }),
+			raft.WithSaveHardState(func(st rafttype.HardState) error { return disk.ForTestFixture().SaveHardState("gap", st) }),
 			raft.WithNodeId(id),
 			raft.WithReplicas([]uint64{1, 2, 3}),
 			raft.WithElectionOn(false),
@@ -117,13 +117,13 @@ func (c *gapCluster) handle(r *gapReplica, e rafttype.Event) {
 	}
 	switch e.Type {
 	case rafttype.StoreReq:
-		require.NoError(c.t, r.disk.AppendLogs("gap", e.Logs, e.TermStartIndexInfo))
+		require.NoError(c.t, r.disk.ForTestFixture().AppendLogs("gap", e.Logs, e.TermStartIndexInfo))
 		for _, l := range e.Logs {
 			r.logs[l.Index] = l
 		}
 		_ = r.node.Step(rafttype.StoreResponse(e, rafttype.Event{Type: rafttype.StoreResp, Index: e.Logs[len(e.Logs)-1].Index, Logs: e.Logs, Reason: rafttype.ReasonOk}))
 	case rafttype.ApplyReq:
-		require.NoError(c.t, r.disk.SetAppliedIndex("gap", e.EndIndex-1))
+		require.NoError(c.t, r.disk.ForTestFixture().SetAppliedIndex("gap", e.EndIndex-1))
 		_ = r.node.Step(rafttype.Event{Type: rafttype.ApplyResp, Index: e.EndIndex - 1, Reason: rafttype.ReasonOk})
 	case rafttype.GetLogsReq:
 		var logs []rafttype.Log
@@ -134,7 +134,7 @@ func (c *gapCluster) handle(r *gapReplica, e rafttype.Event) {
 		}
 		_ = r.node.Step(rafttype.Event{Type: rafttype.GetLogsResp, To: e.From, Index: e.Index, Logs: logs, Reason: rafttype.ReasonOk})
 	case rafttype.TruncateReq:
-		require.NoError(c.t, r.disk.TruncateLogTo("gap", e.Index))
+		require.NoError(c.t, r.disk.ForTestFixture().TruncateLogTo("gap", e.Index))
 		for i := range r.logs {
 			if i > e.Index {
 				delete(r.logs, i)
@@ -158,7 +158,7 @@ func (c *gapCluster) probe(ids ...uint64) map[uint64]*ChannelLastLogInfoResponse
 	for _, id := range ids {
 		n := c.replicas[id].node
 		require.NoError(c.t, n.FenceElection(n.Config(), n.LastTerm()+1))
-		state, err := c.replicas[id].disk.GetState("gap")
+		state, err := c.replicas[id].disk.ForTestFixture().GetState("gap")
 		require.NoError(c.t, err)
 		c.reports[id] = rafttype.ElectionReport{NodeID: id, Term: state.HardState.FenceTerm, Fenced: true, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor}
 		infos[id] = &ChannelLastLogInfoResponse{LogTerm: state.LastTerm, LogIndex: state.LastLogIndex, Term: state.HardState.Term}

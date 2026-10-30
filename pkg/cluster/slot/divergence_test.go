@@ -14,7 +14,7 @@ func TestTruncateBelowAppliedTypedAndCounted(t *testing.T) {
 	storage := openTestStorage(t, t.TempDir())
 	defer storage.Close()
 	seedSlot(t, storage, "7", 10, 8, 2)
-	err := storage.TruncateLogTo("7", 7)
+	err := storage.truncateLogTo("7", 7)
 	if !errors.Is(err, types.ErrTruncateBelowApplied) {
 		t.Fatalf("err = %v, want ErrTruncateBelowApplied", err)
 	}
@@ -34,13 +34,13 @@ func TestAppendEqualReplayBelowAppliedSkipped(t *testing.T) {
 
 	replay := append([]types.Log(nil), logs[3:6]...) // 4, 5 (applied) and 6
 	replay = append(replay, types.Log{Index: 7, Term: 2, Id: 1007, Data: []byte("new")})
-	if err := storage.AppendLogs(shardNo, replay, nil); err != nil {
+	if err := storage.appendLogs(shardNo, replay, nil); err != nil {
 		t.Fatalf("equal replay: %v", err)
 	}
 	if !bytes.Equal(before4, rawLog(t, storage, shardNo, 4)) {
 		t.Fatal("applied entry rewritten by an equal replay")
 	}
-	if last, _ := storage.LastIndex(shardNo); last != 7 {
+	if last, _ := storage.lastIndex(shardNo); last != 7 {
 		t.Fatalf("last = %d, want 7", last)
 	}
 	st := storage.s.DivergenceStats()
@@ -63,11 +63,11 @@ func TestAppendConflictBelowAppliedTyped(t *testing.T) {
 			seedSlot(t, storage, "3", 6, 5, 2)
 			if entry.Index == 7 {
 				// applied beyond the log: 7 is "applied" but absent.
-				if err := storage.SetAppliedIndex("3", 8); err != nil {
+				if err := storage.setAppliedIndex("3", 8); err != nil {
 					t.Fatal(err)
 				}
 			}
-			err := storage.AppendLogs("3", []types.Log{entry}, nil)
+			err := storage.appendLogs("3", []types.Log{entry}, nil)
 			if !errors.Is(err, types.ErrAppendBelowApplied) {
 				t.Fatalf("err = %v, want ErrAppendBelowApplied", err)
 			}
@@ -84,10 +84,10 @@ func TestAppendSameTermConflictAboveAppliedCountedOnly(t *testing.T) {
 	storage := openTestStorage(t, t.TempDir())
 	defer storage.Close()
 	seedSlot(t, storage, "3", 6, 4, 2)
-	if err := storage.AppendLogs("3", []types.Log{{Index: 6, Term: 2, Id: 77, Data: []byte("r")}}, nil); err != nil {
+	if err := storage.appendLogs("3", []types.Log{{Index: 6, Term: 2, Id: 77, Data: []byte("r")}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	logs, _ := storage.GetLogs("3", 6, 7, 0)
+	logs, _ := storage.getLogs("3", 6, 7, 0)
 	if len(logs) != 1 || logs[0].Id != 77 {
 		t.Fatalf("entry 6 = %+v, want replaced", logs)
 	}
@@ -95,7 +95,7 @@ func TestAppendSameTermConflictAboveAppliedCountedOnly(t *testing.T) {
 		t.Fatalf("same-term counter = %d, want 1", got)
 	}
 	// A different-term replacement above applied is not a same-term conflict.
-	if err := storage.AppendLogs("3", []types.Log{{Index: 6, Term: 3, Id: 78, Data: []byte("s")}}, nil); err != nil {
+	if err := storage.appendLogs("3", []types.Log{{Index: 6, Term: 3, Id: 78, Data: []byte("s")}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := storage.s.DivergenceStats().SameTermConflict; got != 1 {
@@ -106,10 +106,10 @@ func TestAppendSameTermConflictAboveAppliedCountedOnly(t *testing.T) {
 func TestTermStartIndexWrittenWithLogsAtomically(t *testing.T) {
 	storage := openTestStorage(t, t.TempDir())
 	defer storage.Close()
-	if err := storage.AppendLogs("4", []types.Log{{Index: 1, Term: 5, Id: 1, Data: []byte("a")}}, &types.TermStartIndexInfo{Term: 5, Index: 1}); err != nil {
+	if err := storage.appendLogs("4", []types.Log{{Index: 1, Term: 5, Id: 1, Data: []byte("a")}}, &types.TermStartIndexInfo{Term: 5, Index: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if idx, _ := storage.GetTermStartIndex("4", 5); idx != 1 {
+	if idx, _ := storage.getTermStartIndex("4", 5); idx != 1 {
 		t.Fatalf("term start = %d", idx)
 	}
 }
@@ -120,10 +120,10 @@ func TestGetStateReportsDivergence(t *testing.T) {
 	storage := openTestStorage(t, path)
 	seedSlot(t, storage, "12", 4, 3, 1)
 	seedSlot(t, storage, "13", 4, 3, 1)
-	if err := storage.SetAppliedIndex("12", 9); err != nil {
+	if err := storage.setAppliedIndex("12", 9); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.MarkDiverged("13", types.ErrTruncateBelowApplied); err != nil {
+	if err := storage.markDiverged("13", types.ErrTruncateBelowApplied); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.Close(); err != nil {
@@ -133,7 +133,7 @@ func TestGetStateReportsDivergence(t *testing.T) {
 	storage = openTestStorage(t, path)
 	defer storage.Close()
 	for shardNo, want := range map[string]bool{"12": true, "13": true} {
-		state, err := storage.GetState(shardNo)
+		state, err := storage.getState(shardNo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -141,7 +141,7 @@ func TestGetStateReportsDivergence(t *testing.T) {
 			t.Fatalf("slot %s Diverged = %v", shardNo, state.Diverged)
 		}
 	}
-	state, _ := storage.GetState("13")
+	state, _ := storage.getState("13")
 	if state.AppliedIndex != 3 || state.LastLogIndex != 4 {
 		t.Fatalf("slot 13 state = %+v", state)
 	}
@@ -157,7 +157,7 @@ func TestMarkDivergedFencesBeforeWriting(t *testing.T) {
 		return nil
 	}
 	defer func() { setDivergedMarkerHook = nil }()
-	if err := storage.MarkDiverged("21", types.ErrTruncateBelowApplied); err != nil {
+	if err := storage.markDiverged("21", types.ErrTruncateBelowApplied); err != nil {
 		t.Fatal(err)
 	}
 	if !errors.Is(fencedDuringWrite, types.ErrSlotDiverged) {
@@ -169,7 +169,7 @@ func TestMarkDivergedFencesBeforeWriting(t *testing.T) {
 	if err := storage.s.CheckSlotReadable(22); err != nil {
 		t.Fatalf("other slot fenced: %v", err)
 	}
-	if marked, _ := storage.DivergedMarker("21"); !marked {
+	if marked, _ := storage.divergedMarker("21"); !marked {
 		t.Fatal("marker not persisted")
 	}
 }
@@ -182,7 +182,7 @@ func TestMarkerPersistFailureFailStopsAndRestartExposure(t *testing.T) {
 	storage := openTestStorage(t, path)
 	seedSlot(t, storage, "5", 10, 8, 2)
 	setDivergedMarkerHook = func(string) error { return errors.New("injected ENOSPC") }
-	err := storage.MarkDiverged("5", types.ErrTruncateBelowApplied)
+	err := storage.markDiverged("5", types.ErrTruncateBelowApplied)
 	setDivergedMarkerHook = nil
 	if err == nil {
 		t.Fatal("marker write failure not reported")
@@ -203,7 +203,7 @@ func TestMarkerPersistFailureFailStopsAndRestartExposure(t *testing.T) {
 	// Restart: no marker, applied == 8 <= last == 10. Exposure A4.
 	storage = openTestStorage(t, path)
 	defer storage.Close()
-	state, err := storage.GetState("5")
+	state, err := storage.getState("5")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestMarkerPersistFailureFailStopsAndRestartExposure(t *testing.T) {
 		t.Fatal("expected a fresh process to start healthy")
 	}
 	// The next truncation below applied is refused again.
-	if err := storage.TruncateLogTo("5", 6); !errors.Is(err, types.ErrTruncateBelowApplied) {
+	if err := storage.truncateLogTo("5", 6); !errors.Is(err, types.ErrTruncateBelowApplied) {
 		t.Fatalf("second refusal = %v", err)
 	}
 }
@@ -230,11 +230,11 @@ func TestScanDivergenceReadOnlyAndExact(t *testing.T) {
 	seedSlot(t, storage, "1", 5, 5, 1) // healthy, applied == last
 	seedSlot(t, storage, "2", 5, 2, 1) // healthy
 	seedSlot(t, storage, "3", 2, 0, 1) // applied beyond log
-	if err := storage.SetAppliedIndex("3", 4); err != nil {
+	if err := storage.setAppliedIndex("3", 4); err != nil {
 		t.Fatal(err)
 	}
 	seedSlot(t, storage, "40", 3, 1, 1) // marker
-	if err := storage.MarkDiverged("40", types.ErrAppendBelowApplied); err != nil {
+	if err := storage.markDiverged("40", types.ErrAppendBelowApplied); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.Close(); err != nil {
@@ -266,7 +266,7 @@ func TestScanDivergenceReadOnlyAndExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer storage.Close()
-	if applied, _ := storage.AppliedIndex("3"); applied != 4 {
+	if applied, _ := storage.appliedIndex("3"); applied != 4 {
 		t.Fatalf("scan rewrote applied index to %d", applied)
 	}
 }

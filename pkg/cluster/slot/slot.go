@@ -23,11 +23,11 @@ func newSlot(slot *types.Slot, s *Server) (*Slot, error) {
 		shardNo: shardNo,
 		Log:     wklog.NewWKLog("slot"),
 	}
-	state, err := s.storage.GetState(shardNo)
+	state, err := s.storage.BoundGetState(shardNo)
 	if err != nil {
 		return nil, fmt.Errorf("get slot state: %w", err)
 	}
-	lastLogIndex, err := s.storage.GetTermStartIndex(shardNo, state.LastTerm)
+	lastLogIndex, err := s.storage.BoundGetTermStartIndex(shardNo, state.LastTerm)
 	if err != nil {
 		return nil, fmt.Errorf("get slot term: %w", err)
 	}
@@ -40,7 +40,7 @@ func newSlot(slot *types.Slot, s *Server) (*Slot, error) {
 	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(
 		raft.WithKey(shardNo),
 		raft.WithNodeId(s.opts.NodeId),
-		raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.storage.SaveHardState(shardNo, state) }),
+		raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.saveSlotHardState(shardNo, st, state) }),
 		// Leader hand-off by role switch keeps the term (learner) or bypasses
 		// the healthy-quorum election; slot leadership changes only by election.
 		raft.WithLeaderRoleSwitchDisabled(true),

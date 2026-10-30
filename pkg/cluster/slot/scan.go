@@ -55,15 +55,15 @@ func ScanDivergence(logDBPath string, shardNum uint32, slotCount uint32) ([]Slot
 	var flagged []SlotScanResult
 	for slotId := uint32(0); slotId < slotCount; slotId++ {
 		shardNo := SlotIdToKey(slotId)
-		applied, err := p.AppliedIndex(shardNo)
+		applied, err := p.appliedIndex(shardNo)
 		if err != nil {
 			return nil, fmt.Errorf("slot scan: slot %d applied index: %w", slotId, err)
 		}
-		last, err := p.LastIndex(shardNo)
+		last, err := p.lastIndex(shardNo)
 		if err != nil {
 			return nil, fmt.Errorf("slot scan: slot %d last index: %w", slotId, err)
 		}
-		marker, err := p.DivergedMarker(shardNo)
+		marker, err := p.divergedMarker(shardNo)
 		if err != nil {
 			return nil, fmt.Errorf("slot scan: slot %d marker: %w", slotId, err)
 		}

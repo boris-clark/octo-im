@@ -50,6 +50,7 @@ type RaftGroup struct {
 	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
 	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
 	proposalStats proposalStats
+	started       atomic.Bool
 	stopOnce      sync.Once
 	stopBegun     atomic.Bool
 	// loopDone closes once the shutdown lifecycle joined the event loop,
@@ -90,6 +91,9 @@ func New(opts *Options) *RaftGroup {
 		loopDone:           make(chan struct{}),
 	}
 	storage := opts.Storage
+	if bs, ok := storage.(BoundStorage); ok {
+		bs.AttachStorageDomain(rg)
+	}
 	rg.wait = newWait(func(key string, index uint64) (types.Log, bool, error) { return readStorageLog(storage, key, index) })
 	var err error
 	rg.goPool, err = ants.NewPool(opts.GoPoolSize, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
@@ -191,6 +195,7 @@ func (rg *RaftGroup) IsLeader(raftKey string) bool {
 }
 
 func (rg *RaftGroup) Start() error {
+	rg.started.Store(true)
 	rg.stopper.RunWorker(rg.loopEvent)
 	return nil
 }
@@ -241,7 +246,15 @@ func (rg *RaftGroup) BeginStop() {
 
 // readLog point-reads one stored log for receipt verification.
 func readStorageLog(storage IStorage, raftKey string, index uint64) (types.Log, bool, error) {
-	logs, err := storage.GetLogs(raftKey, index, index+1, 0)
+	var (
+		logs []types.Log
+		err  error
+	)
+	if bs, ok := storage.(BoundStorage); ok {
+		logs, err = bs.BoundGetLogs(raftKey, index, index+1, 0)
+	} else {
+		logs, err = storage.GetLogs(raftKey, index, index+1, 0)
+	}
 	if err != nil {
 		return types.Log{}, false, err
 	}

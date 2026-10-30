@@ -45,7 +45,13 @@ func ValidMembershipTransition(old, next Config) bool {
 	}
 	if slices.Equal(old.Replicas, next.Replicas) {
 		if slices.Equal(old.Learners, next.Learners) && next.MigrateFrom == 0 && next.MigrateTo == 0 {
-			return old.MigrateFrom == old.Leader && old.MigrateTo == next.Leader
+			return old.MigrateFrom == old.Leader && old.MigrateTo == next.Leader ||
+				old.MigrateFrom == 0 && old.MigrateTo == 0 && next.Leader != old.Leader && slices.Contains(old.Replicas, next.Leader)
+		}
+		if slices.Equal(old.Learners, next.Learners) && next.Leader == old.Leader &&
+			old.MigrateFrom == 0 && old.MigrateTo == 0 &&
+			next.MigrateFrom == old.Leader && next.MigrateTo != old.Leader && slices.Contains(old.Replicas, next.MigrateTo) {
+			return true
 		}
 		if next.Leader != old.Leader || !slices.Contains(next.Learners, next.MigrateTo) ||
 			(next.MigrateFrom != next.MigrateTo && !slices.Contains(old.Replicas, next.MigrateFrom)) {

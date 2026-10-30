@@ -4,20 +4,42 @@ import (
 	"encoding/json"
 	"errors"
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	rt "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"google.golang.org/protobuf/proto"
 )
 
 var ErrSlotInstallConflict = errors.New("slot conditional install did not match applied identity")
 
 type slotInstall struct {
-	Expected *pb.Slot
-	Next     *pb.Slot
+	Expected   *pb.Slot
+	Next       *pb.Slot
+	Membership *rt.MembershipCertificate
+}
+
+func slotToRaftConfig(st *pb.Slot) rt.Config {
+	if st == nil {
+		return rt.Config{}
+	}
+	return rt.Config{
+		Replicas:      st.Replicas,
+		Learners:      st.Learners,
+		MigrateFrom:   st.MigrateFrom,
+		MigrateTo:     st.MigrateTo,
+		Leader:        st.Leader,
+		Term:          st.Term,
+		InstalledTerm: st.InstalledTerm,
+		BoundaryTerm:  st.BoundaryTerm,
+	}
 }
 
 // ProposeSlotInstall never retries an unknown result with the old decision.
 // Applied state, including all membership and migration fields, decides the result.
 func (s *Server) ProposeSlotInstall(expected, next *pb.Slot) error {
-	data, err := json.Marshal(slotInstall{expected.Clone(), next.Clone()})
+	return s.ProposeSlotInstallWithMembership(expected, next, nil)
+}
+
+func (s *Server) ProposeSlotInstallWithMembership(expected, next *pb.Slot, cert *rt.MembershipCertificate) error {
+	data, err := json.Marshal(slotInstall{Expected: expected.Clone(), Next: next.Clone(), Membership: cert})
 	if err != nil {
 		return err
 	}
@@ -38,10 +60,14 @@ func (s *Server) ProposeSlotInstall(expected, next *pb.Slot) error {
 }
 
 func (c *Config) installSlot(expected, next *pb.Slot) bool {
+	return c.installSlotWithMembership(expected, next, nil)
+}
+
+func (c *Config) installSlotWithMembership(expected, next *pb.Slot, cert *rt.MembershipCertificate) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, current := range c.cfg.Slots {
-		if result, ok := ConditionalSlotInstall(current, expected, next); ok {
+		if result, ok := ConditionalSlotInstallWithMembership(current, expected, next, cert); ok {
 			c.cfg.Slots[i] = result
 			return true
 		}
@@ -81,12 +107,28 @@ func ConditionalSlotInstall(current, expected, next *pb.Slot) (*pb.Slot, bool) {
 	return next.Clone(), true
 }
 
+func ConditionalSlotInstallWithMembership(current, expected, next *pb.Slot, cert *rt.MembershipCertificate) (*pb.Slot, bool) {
+	if cert == nil {
+		return ConditionalSlotInstall(current, expected, next)
+	}
+	if current == nil || expected == nil || next == nil || !proto.Equal(current, expected) || expected.Id != next.Id || expected.Term == ^uint32(0) || next.Term != expected.Term+1 || next.InstalledTerm != next.Term || next.Leader == 0 {
+		return nil, false
+	}
+	if expected.BoundaryTerm != 0 && next.BoundaryTerm < expected.BoundaryTerm {
+		return nil, false
+	}
+	if err := rt.ValidateMembershipInstall(slotToRaftConfig(expected), slotToRaftConfig(next), cert); err != nil {
+		return nil, false
+	}
+	return next.Clone(), true
+}
+
 func (s *Server) handleSlotInstall(cmd *CMD) error {
 	var change slotInstall
 	if err := json.Unmarshal(cmd.Data, &change); err != nil {
 		return err
 	}
-	s.config.installSlot(change.Expected, change.Next)
+	s.config.installSlotWithMembership(change.Expected, change.Next, change.Membership)
 	return nil
 }
 
