@@ -27,9 +27,9 @@ func (s *Server) FenceElection(ctx context.Context, expected *pb.Slot, term uint
 			return err
 		}
 		var state types.RaftState
-		if err := s.raftGroup.WithInstanceStorageLease(st, func() error {
+		if err := s.raftGroup.StorageBinding(st).WithStorage(func(call *raftgroup.StorageCall) error {
 			var err error
-			state, err = s.storage.BoundGetState(key)
+			state, err = s.storage.BindStorage(call).(*storageView).GetState(key)
 			return err
 		}); err != nil {
 			return err

@@ -18,13 +18,13 @@ func TestRaftMetadataWritesUseGroupCommit(t *testing.T) {
 		{
 			name: "append logs",
 			write: func(storage *PebbleShardLogStorage) error {
-				return storage.appendLogs("1", []types.Log{{Index: 1, Term: 1, Data: []byte("command")}}, nil)
+				return storage.AppendLogs("1", []types.Log{{Index: 1, Term: 1, Data: []byte("command")}}, nil)
 			},
 		},
 		{
 			name: "set applied index",
 			write: func(storage *PebbleShardLogStorage) error {
-				return storage.setAppliedIndex("1", 1)
+				return storage.SetAppliedIndex("1", 1)
 			},
 		},
 	}
@@ -87,13 +87,13 @@ func TestApplyDoesNotSerializeDifferentSlotsInSameDBShard(t *testing.T) {
 
 	errCh := make(chan error, 2)
 	go func() {
-		errCh <- storage.apply("1", []types.Log{{Index: 1}})
+		errCh <- storage.Apply("1", []types.Log{{Index: 1}})
 	}()
 
 	waitForApply(t, entered, "first slot")
 
 	go func() {
-		errCh <- storage.apply("2", []types.Log{{Index: 1}})
+		errCh <- storage.Apply("2", []types.Log{{Index: 1}})
 	}()
 
 	waitForApply(t, entered, "second slot")
@@ -113,13 +113,13 @@ func TestApplySerializesSameSlot(t *testing.T) {
 
 	errCh := make(chan error, 2)
 	go func() {
-		errCh <- storage.apply("1", []types.Log{{Index: 1}})
+		errCh <- storage.Apply("1", []types.Log{{Index: 1}})
 	}()
 
 	waitForApply(t, entered, "first apply")
 
 	go func() {
-		errCh <- storage.apply("1", []types.Log{{Index: 2}})
+		errCh <- storage.Apply("1", []types.Log{{Index: 2}})
 	}()
 
 	select {

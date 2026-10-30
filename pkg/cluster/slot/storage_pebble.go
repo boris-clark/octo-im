@@ -37,11 +37,16 @@ type PebbleShardLogStorage struct {
 	stopper syncutil.Stopper
 	s       *Server
 
+	// closeMu joins concurrent Open/Close callers; domainMu protects admission.
+	closeMu         sync.Mutex
+	closeErr        error
 	domainMu        sync.Mutex
 	attachedGroups  []*raftgroup.RaftGroup
 	domainOps       int
 	domainClosed    bool
+	domainOpen      bool
 	fixtureDisabled bool
+	domainOwners    map[string]*raftgroup.RaftGroup
 
 	// slotLocks serializes operations for the same raft slot without coupling
 	// unrelated slots that happen to share one physical Pebble DB shard.
@@ -99,11 +104,28 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 	}
 }
 
-func (p *PebbleShardLogStorage) Open() error {
+func (p *PebbleShardLogStorage) Open() (openErr error) {
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
 	p.domainMu.Lock()
-	p.domainClosed = false
+	if len(p.dbs) != 0 || p.domainClosed {
+		p.domainMu.Unlock()
+		return errors.New("slot storage already opened or closed")
+	}
 	p.domainMu.Unlock()
 
+	defer func() {
+		if openErr != nil {
+			for _, b := range p.batchDbs {
+				b.Stop()
+			}
+			for _, db := range p.dbs {
+				openErr = errors.Join(openErr, db.Close())
+			}
+			p.dbs = nil
+			p.batchDbs = nil
+		}
+	}()
 	opts := p.defaultPebbleOptions()
 
 	for i := 0; i < int(p.shardNum); i++ {
@@ -118,14 +140,19 @@ func (p *PebbleShardLogStorage) Open() error {
 		p.batchDbs = append(p.batchDbs, batchDb)
 	}
 
+	p.domainMu.Lock()
+	p.domainOpen = true
+	p.domainMu.Unlock()
 	return nil
 }
 
 func (p *PebbleShardLogStorage) Close() error {
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
 	p.domainMu.Lock()
 	if p.domainClosed {
 		p.domainMu.Unlock()
-		return nil
+		return p.closeErr
 	}
 	if p.domainOps != 0 {
 		p.domainMu.Unlock()
@@ -145,257 +172,52 @@ func (p *PebbleShardLogStorage) Close() error {
 	}
 	for _, db := range p.dbs {
 		if err := db.Close(); err != nil {
+			p.closeErr = errors.Join(p.closeErr, err)
 			p.Error("close db error", zap.Error(err))
 		}
 	}
 
 	p.stopper.Stop()
 
-	return nil
+	return p.closeErr
 }
 
-func (p *PebbleShardLogStorage) AttachStorageDomain(g *raftgroup.RaftGroup) {
+func (p *PebbleShardLogStorage) AttachStorageDomain(g *raftgroup.RaftGroup) error {
 	if g == nil {
-		return
+		return ErrStorageUnbound
 	}
 	p.domainMu.Lock()
 	defer p.domainMu.Unlock()
+	if p.domainClosed {
+		return ErrStorageUnbound
+	}
 	p.fixtureDisabled = true
 	for _, existing := range p.attachedGroups {
 		if existing == g {
-			return
+			return nil
 		}
 	}
 	p.attachedGroups = append(p.attachedGroups, g)
+	return nil
 }
 
 func (p *PebbleShardLogStorage) DetachStorageDomain(g *raftgroup.RaftGroup) {
+	if !g.IsStorageQuiescent() {
+		return
+	}
 	p.domainMu.Lock()
 	defer p.domainMu.Unlock()
 	for i, existing := range p.attachedGroups {
 		if existing == g {
 			p.attachedGroups = append(p.attachedGroups[:i], p.attachedGroups[i+1:]...)
+			for key, owner := range p.domainOwners {
+				if owner == g {
+					delete(p.domainOwners, key)
+				}
+			}
 			return
 		}
 	}
-}
-
-func (p *PebbleShardLogStorage) primaryGroup() *raftgroup.RaftGroup {
-	if p.s != nil && p.s.raftGroup != nil {
-		return p.s.raftGroup
-	}
-	p.domainMu.Lock()
-	defer p.domainMu.Unlock()
-	if len(p.attachedGroups) > 0 {
-		return p.attachedGroups[0]
-	}
-	return nil
-}
-
-func (p *PebbleShardLogStorage) withBoundOp(fn func() error) error {
-	p.domainMu.Lock()
-	if p.domainClosed || len(p.dbs) == 0 {
-		p.domainMu.Unlock()
-		return ErrStorageUnbound
-	}
-	p.domainOps++
-	p.domainMu.Unlock()
-	defer func() {
-		p.domainMu.Lock()
-		p.domainOps--
-		p.domainMu.Unlock()
-	}()
-	return fn()
-}
-
-func (p *PebbleShardLogStorage) withBoundKeyOp(key string, fn func() error) error {
-	p.domainMu.Lock()
-	if p.domainClosed || len(p.dbs) == 0 {
-		p.domainMu.Unlock()
-		return ErrStorageUnbound
-	}
-	authorized := false
-	for _, g := range p.attachedGroups {
-		if g.HasInFlightStorageEffect(key) {
-			authorized = true
-			break
-		}
-	}
-	if !authorized {
-		p.domainMu.Unlock()
-		return ErrStorageUnbound
-	}
-	p.domainOps++
-	p.domainMu.Unlock()
-	defer func() {
-		p.domainMu.Lock()
-		p.domainOps--
-		p.domainMu.Unlock()
-	}()
-	return fn()
-}
-
-func (p *PebbleShardLogStorage) BoundGetState(shardNo string) (types.RaftState, error) {
-	var st types.RaftState
-	err := p.withBoundKeyOp(shardNo, func() error {
-		var err error
-		st, err = p.getState(shardNo)
-		return err
-	})
-	return st, err
-}
-
-func (p *PebbleShardLogStorage) BoundAppendLogs(shardNo string, logs []types.Log, termStartIndexInfo *types.TermStartIndexInfo) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.appendLogs(shardNo, logs, termStartIndexInfo)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundTruncateLogTo(shardNo string, index uint64) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.truncateLogTo(shardNo, index)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundGetLogs(shardNo string, startLogIndex uint64, endLogIndex uint64, limitSize uint64) ([]types.Log, error) {
-	var logs []types.Log
-	err := p.withBoundKeyOp(shardNo, func() error {
-		var err error
-		logs, err = p.getLogs(shardNo, startLogIndex, endLogIndex, limitSize)
-		return err
-	})
-	return logs, err
-}
-
-func (p *PebbleShardLogStorage) BoundApply(shardNo string, logs []types.Log) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.apply(shardNo, logs)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundSaveConfig(shardNo string, cfg types.Config) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.saveConfig(shardNo, cfg)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundGetTermStartIndex(shardNo string, term uint32) (uint64, error) {
-	var idx uint64
-	err := p.withBoundKeyOp(shardNo, func() error {
-		var err error
-		idx, err = p.getTermStartIndex(shardNo, term)
-		return err
-	})
-	return idx, err
-}
-
-func (p *PebbleShardLogStorage) BoundLeaderLastLogTerm(shardNo string) (uint32, error) {
-	var term uint32
-	err := p.withBoundKeyOp(shardNo, func() error {
-		var err error
-		term, err = p.leaderLastLogTerm(shardNo)
-		return err
-	})
-	return term, err
-}
-
-func (p *PebbleShardLogStorage) BoundLeaderTermGreaterEqThan(shardNo string, term uint32) (uint32, error) {
-	var out uint32
-	err := p.withBoundKeyOp(shardNo, func() error {
-		var err error
-		out, err = p.leaderTermGreaterEqThan(shardNo, term)
-		return err
-	})
-	return out, err
-}
-
-func (p *PebbleShardLogStorage) BoundDeleteLeaderTermStartIndexGreaterThanTerm(shardNo string, term uint32) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.deleteLeaderTermStartIndexGreaterThanTerm(shardNo, term)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundMarkDiverged(shardNo string, reason error) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.markDiverged(shardNo, reason)
-	})
-}
-
-func (p *PebbleShardLogStorage) BoundSaveHardState(shardNo string, state types.HardState) error {
-	return p.withBoundKeyOp(shardNo, func() error {
-		return p.saveHardState(shardNo, state)
-	})
-}
-
-// TestFixtureView provides explicit test-fixture access to an unattached
-// PebbleShardLogStorage before any RaftGroup attaches to the storage domain.
-// Once a RaftGroup attaches to the domain, all TestFixtureView methods are
-// irrevocably disabled and return ErrStorageUnbound.
-type TestFixtureView struct {
-	p *PebbleShardLogStorage
-}
-
-func (p *PebbleShardLogStorage) ForTestFixture() *TestFixtureView {
-	return &TestFixtureView{p: p}
-}
-
-func (v *TestFixtureView) withOp(fn func() error) error {
-	if v == nil || v.p == nil {
-		return ErrStorageUnbound
-	}
-	v.p.domainMu.Lock()
-	if v.p.domainClosed || v.p.fixtureDisabled || len(v.p.attachedGroups) != 0 || len(v.p.dbs) == 0 {
-		v.p.domainMu.Unlock()
-		return ErrStorageUnbound
-	}
-	v.p.domainOps++
-	v.p.domainMu.Unlock()
-	defer func() {
-		v.p.domainMu.Lock()
-		v.p.domainOps--
-		v.p.domainMu.Unlock()
-	}()
-	return fn()
-}
-
-func (v *TestFixtureView) GetState(shardNo string) (types.RaftState, error) {
-	var st types.RaftState
-	err := v.withOp(func() error {
-		var err error
-		st, err = v.p.getState(shardNo)
-		return err
-	})
-	return st, err
-}
-
-func (v *TestFixtureView) AppendLogs(shardNo string, logs []types.Log, info *types.TermStartIndexInfo) error {
-	return v.withOp(func() error { return v.p.appendLogs(shardNo, logs, info) })
-}
-
-func (v *TestFixtureView) TruncateLogTo(shardNo string, index uint64) error {
-	return v.withOp(func() error { return v.p.truncateLogTo(shardNo, index) })
-}
-
-func (v *TestFixtureView) GetLogs(shardNo string, start, end, limit uint64) ([]types.Log, error) {
-	var logs []types.Log
-	err := v.withOp(func() error {
-		var err error
-		logs, err = v.p.getLogs(shardNo, start, end, limit)
-		return err
-	})
-	return logs, err
-}
-
-func (v *TestFixtureView) SetAppliedIndex(shardNo string, index uint64) error {
-	return v.withOp(func() error { return v.p.setAppliedIndex(shardNo, index) })
-}
-
-func (v *TestFixtureView) SaveHardState(shardNo string, state types.HardState) error {
-	return v.withOp(func() error { return v.p.saveHardState(shardNo, state) })
-}
-
-func (v *TestFixtureView) MarkDiverged(shardNo string, cause error) error {
-	return v.withOp(func() error { return v.p.markDiverged(shardNo, cause) })
 }
 
 func (p *PebbleShardLogStorage) shardDB(v string) *pebble.DB {
@@ -782,21 +604,36 @@ func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {
 }
 
 func (p *PebbleShardLogStorage) apply(shardNo string, logs []types.Log) error {
+	return p.applyWithReads(shardNo, logs, nil)
+}
+
+func (p *PebbleShardLogStorage) applyWithReads(shardNo string, logs []types.Log, view *storageView) error {
+	if len(logs) == 0 {
+		return nil
+	}
 	// 加锁保护，防止与 TruncateLogTo 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
 	lock.Lock()
 	defer lock.Unlock()
 
-	if p.s.opts.OnApply != nil {
+	if p.s.opts.OnApplyWithReads != nil {
+		reads := &CallbackReads{active: true, key: shardNo, view: view}
+		err := func() error {
+			defer reads.revoke()
+			return p.s.opts.OnApplyWithReads(KeyToSlotId(shardNo), logs, reads)
+		}()
+		if err != nil {
+			return err
+		}
+	} else if p.s.opts.OnApply != nil {
 		slotId := KeyToSlotId(shardNo)
 		err := p.s.opts.OnApply(slotId, logs)
 		if err != nil {
 			return err
 		}
-		err = p.setAppliedIndex(shardNo, logs[len(logs)-1].Index)
-		if err != nil {
-			return err
-		}
+	}
+	if p.s.opts.OnApplyWithReads != nil || p.s.opts.OnApply != nil {
+		return p.setAppliedIndex(shardNo, logs[len(logs)-1].Index)
 	}
 	return nil
 }
@@ -806,6 +643,15 @@ func (p *PebbleShardLogStorage) SaveConfig(shardNo string, cfg types.Config) err
 }
 
 func (p *PebbleShardLogStorage) saveConfig(shardNo string, cfg types.Config) error {
+	return p.saveConfigWithReads(shardNo, cfg, nil)
+}
+
+func (p *PebbleShardLogStorage) saveConfigWithReads(shardNo string, cfg types.Config, view *storageView) error {
+	if p.s.opts.OnSaveConfigWithReads != nil {
+		reads := &CallbackReads{active: true, key: shardNo, view: view}
+		defer reads.revoke()
+		return p.s.opts.OnSaveConfigWithReads(KeyToSlotId(shardNo), cfg, reads)
+	}
 	if p.s.opts.OnSaveConfig != nil {
 		slotId := KeyToSlotId(shardNo)
 		err := p.s.opts.OnSaveConfig(slotId, cfg)

@@ -29,11 +29,11 @@ func seedSlot(t *testing.T, storage *PebbleShardLogStorage, shardNo string, last
 	for i := uint64(1); i <= last; i++ {
 		logs = append(logs, types.Log{Index: i, Term: term, Id: 1000 + i, Data: []byte{byte(i), 'v'}})
 	}
-	if err := storage.appendLogs(shardNo, logs, &types.TermStartIndexInfo{Term: term, Index: 1}); err != nil {
+	if err := storage.AppendLogs(shardNo, logs, &types.TermStartIndexInfo{Term: term, Index: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if applied > 0 {
-		if err := storage.setAppliedIndex(shardNo, applied); err != nil {
+		if err := storage.SetAppliedIndex(shardNo, applied); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -62,14 +62,14 @@ func TestTruncateBelowAppliedRefusedWithoutMutation(t *testing.T) {
 		before[i] = rawLog(t, storage, shardNo, i)
 	}
 
-	err := storage.truncateLogTo(shardNo, 7)
+	err := storage.TruncateLogTo(shardNo, 7)
 	if err == nil {
 		t.Fatal("truncation below the applied index reported success")
 	}
 
-	last, _ := storage.lastIndex(shardNo)
-	applied, _ := storage.appliedIndex(shardNo)
-	termStart, _ := storage.getTermStartIndex(shardNo, 2)
+	last, _ := storage.LastIndex(shardNo)
+	applied, _ := storage.AppliedIndex(shardNo)
+	termStart, _ := storage.GetTermStartIndex(shardNo, 2)
 	if last != 10 || applied != 8 || termStart != 1 {
 		t.Fatalf("state changed: last=%d applied=%d termStart=%d", last, applied, termStart)
 	}
@@ -79,10 +79,10 @@ func TestTruncateBelowAppliedRefusedWithoutMutation(t *testing.T) {
 		}
 	}
 	// Truncating to exactly the applied index stays allowed.
-	if err := storage.truncateLogTo(shardNo, 8); err != nil {
+	if err := storage.TruncateLogTo(shardNo, 8); err != nil {
 		t.Fatalf("truncate to applied: %v", err)
 	}
-	if last, _ := storage.lastIndex(shardNo); last != 8 {
+	if last, _ := storage.LastIndex(shardNo); last != 8 {
 		t.Fatalf("last after truncate to applied = %d", last)
 	}
 }
@@ -101,17 +101,17 @@ func TestAppendConflictBelowAppliedRejectsWholeBatch(t *testing.T) {
 		{Index: 6, Term: 3, Id: 9006, Data: []byte("x")},
 		{Index: 7, Term: 3, Id: 9007, Data: []byte("y")},
 	}
-	err := storage.appendLogs(shardNo, batch, &types.TermStartIndexInfo{Term: 3, Index: 5})
+	err := storage.AppendLogs(shardNo, batch, &types.TermStartIndexInfo{Term: 3, Index: 5})
 	if err == nil {
 		t.Fatal("conflicting append below the applied index reported success")
 	}
 	if !bytes.Equal(before5, rawLog(t, storage, shardNo, 5)) {
 		t.Fatal("applied entry 5 was overwritten")
 	}
-	if last, _ := storage.lastIndex(shardNo); last != 6 {
+	if last, _ := storage.LastIndex(shardNo); last != 6 {
 		t.Fatalf("last index = %d, want 6 (no entry of the batch written)", last)
 	}
-	if idx, _ := storage.getTermStartIndex(shardNo, 3); idx != 0 {
+	if idx, _ := storage.GetTermStartIndex(shardNo, 3); idx != 0 {
 		t.Fatalf("term start index for term 3 = %d, want absent", idx)
 	}
 }
@@ -123,17 +123,17 @@ func TestGetStateDoesNotRewindAppliedBeyondLog(t *testing.T) {
 	defer storage.Close()
 	const shardNo = "12"
 	seedSlot(t, storage, shardNo, 4, 0, 1)
-	if err := storage.setAppliedIndex(shardNo, 9); err != nil {
+	if err := storage.SetAppliedIndex(shardNo, 9); err != nil {
 		t.Fatal(err)
 	}
-	state, err := storage.getState(shardNo)
+	state, err := storage.GetState(shardNo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if state.AppliedIndex != 9 {
 		t.Fatalf("reported applied index = %d, want 9 (unchanged)", state.AppliedIndex)
 	}
-	if applied, _ := storage.appliedIndex(shardNo); applied != 9 {
+	if applied, _ := storage.AppliedIndex(shardNo); applied != 9 {
 		t.Fatalf("stored applied index rewritten to %d", applied)
 	}
 }

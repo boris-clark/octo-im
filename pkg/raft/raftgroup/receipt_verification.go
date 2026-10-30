@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
 
 var errGroupNotStopped = errors.New("raftgroup: not stopped")
@@ -96,7 +97,11 @@ func (rg *RaftGroup) verifyReceiptAsync(w *receiptWaiter) {
 			rg.wait.complete(w, proposalOutcomeUnknown(ErrGroupStopped))
 			return
 		}
-		rg.wait.readReceipt(w)
+		if _, bound := rg.opts.Storage.(BoundStorage); bound {
+			rg.wait.readReceiptWith(w, func(key string, index uint64) (types.Log, bool, error) { return readStorageLog(op.storage, key, index) })
+		} else {
+			rg.wait.readReceipt(w)
+		}
 	})
 	if err != nil {
 		rg.disposeStorageOperation(op)

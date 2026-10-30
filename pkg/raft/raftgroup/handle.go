@@ -64,13 +64,6 @@ func isDivergence(err error) bool {
 // is durable, ReasonDivergedFailStop when it is not (or cannot be) written.
 func (rg *RaftGroup) markDiverged(storage IStorage, key string, cause error) types.Reason {
 	rg.Error("storage refused a request below the applied index; quarantining replica", zap.String("key", key), zap.Error(cause))
-	if bs, ok := storage.(BoundStorage); ok {
-		if err := bs.BoundMarkDiverged(key, cause); err != nil {
-			rg.Error("divergence marker not persisted; replica fail-stopped", zap.String("key", key), zap.Error(err))
-			return types.ReasonDivergedFailStop
-		}
-		return types.ReasonDiverged
-	}
 	marker, ok := storage.(DivergenceMarker)
 	if !ok {
 		rg.Error("storage cannot persist a divergence marker; replica fail-stopped", zap.String("key", key))
@@ -511,64 +504,37 @@ func (rg *RaftGroup) handleDestory(r IRaft) {
 }
 
 func storageAppendLogs(s IStorage, key string, logs []types.Log, info *types.TermStartIndexInfo) error {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundAppendLogs(key, logs, info)
-	}
 	return s.AppendLogs(key, logs, info)
 }
 
 func storageGetLogs(s IStorage, key string, start, end, limit uint64) ([]types.Log, error) {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundGetLogs(key, start, end, limit)
-	}
 	return s.GetLogs(key, start, end, limit)
 }
 
 func storageTruncateLogTo(s IStorage, key string, index uint64) error {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundTruncateLogTo(key, index)
-	}
 	return s.TruncateLogTo(key, index)
 }
 
 func storageDeleteLeaderTermStartIndexGreaterThanTerm(s IStorage, key string, term uint32) error {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundDeleteLeaderTermStartIndexGreaterThanTerm(key, term)
-	}
 	return s.DeleteLeaderTermStartIndexGreaterThanTerm(key, term)
 }
 
 func storageApply(s IStorage, key string, logs []types.Log) error {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundApply(key, logs)
-	}
 	return s.Apply(key, logs)
 }
 
 func storageLeaderLastLogTerm(s IStorage, key string) (uint32, error) {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundLeaderLastLogTerm(key)
-	}
 	return s.LeaderLastLogTerm(key)
 }
 
 func storageLeaderTermGreaterEqThan(s IStorage, key string, term uint32) (uint32, error) {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundLeaderTermGreaterEqThan(key, term)
-	}
 	return s.LeaderTermGreaterEqThan(key, term)
 }
 
 func storageGetTermStartIndex(s IStorage, key string, term uint32) (uint64, error) {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundGetTermStartIndex(key, term)
-	}
 	return s.GetTermStartIndex(key, term)
 }
 
 func storageSaveConfig(s IStorage, key string, cfg types.Config) error {
-	if bs, ok := s.(BoundStorage); ok {
-		return bs.BoundSaveConfig(key, cfg)
-	}
 	return s.SaveConfig(key, cfg)
 }

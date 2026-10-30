@@ -74,7 +74,7 @@ func newDiagGroup(t *testing.T, key string, leader uint64, term uint32) *diagGro
 		require.NoError(t, disk.Open())
 		t.Cleanup(func() { require.NoError(t, disk.Close()) })
 		opts := raft.NewOptions(
-			raft.WithSaveHardState(func(st rafttypes.HardState) error { return disk.ForTestFixture().SaveHardState(key, st) }),
+			raft.WithSaveHardState(func(st rafttypes.HardState) error { return disk.SaveHardState(key, st) }),
 			raft.WithNodeId(id),
 			raft.WithReplicas(diagReplicas),
 			raft.WithElectionOn(false),
@@ -138,7 +138,7 @@ func (g *diagGroup) round() {
 func (g *diagGroup) local(r *diagReplica, e rafttypes.Event) {
 	switch e.Type {
 	case rafttypes.StoreReq:
-		if err := r.disk.ForTestFixture().AppendLogs(r.key, e.Logs, e.TermStartIndexInfo); err != nil {
+		if err := r.disk.AppendLogs(r.key, e.Logs, e.TermStartIndexInfo); err != nil {
 			panic(err)
 		}
 		for _, l := range e.Logs {
@@ -146,7 +146,7 @@ func (g *diagGroup) local(r *diagReplica, e rafttypes.Event) {
 		}
 		_ = r.n.Step(rafttypes.StoreResponse(e, rafttypes.Event{Type: rafttypes.StoreResp, Index: e.Logs[len(e.Logs)-1].Index, Logs: e.Logs, Reason: rafttypes.ReasonOk}))
 	case rafttypes.ApplyReq:
-		if err := r.disk.ForTestFixture().SetAppliedIndex(r.key, e.EndIndex-1); err != nil {
+		if err := r.disk.SetAppliedIndex(r.key, e.EndIndex-1); err != nil {
 			panic(err)
 		}
 		_ = r.n.Step(rafttypes.Event{Type: rafttypes.ApplyResp, Index: e.EndIndex - 1, Reason: rafttypes.ReasonOk})
@@ -159,7 +159,7 @@ func (g *diagGroup) local(r *diagReplica, e rafttypes.Event) {
 		}
 		_ = r.n.Step(rafttypes.Event{Type: rafttypes.GetLogsResp, From: e.From, To: e.From, Index: e.Index, Logs: logs, Reason: rafttypes.ReasonOk})
 	case rafttypes.TruncateReq:
-		if err := r.disk.ForTestFixture().TruncateLogTo(r.key, e.Index); err != nil {
+		if err := r.disk.TruncateLogTo(r.key, e.Index); err != nil {
 			panic(err)
 		}
 		for idx := range r.store {
@@ -325,7 +325,7 @@ func runSlotCandidateDiag(t *testing.T, mode diagMode) diagOutcome {
 	for _, id := range []uint64{diagB, diagC} {
 		r := slotG.nodes[id]
 		require.NoError(t, r.n.FenceElection(candidateSlotConfig(candSlot), 2))
-		state, err := r.disk.ForTestFixture().GetState(r.key)
+		state, err := r.disk.GetState(r.key)
 		require.NoError(t, err)
 		reports[id] = rafttypes.ElectionReport{NodeID: id, Term: state.HardState.FenceTerm, Fenced: state.HardState.FenceTerm == 2, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor}
 	}

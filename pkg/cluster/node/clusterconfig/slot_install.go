@@ -117,6 +117,19 @@ func ConditionalSlotInstallWithMembership(current, expected, next *pb.Slot, cert
 	if expected.BoundaryTerm != 0 && next.BoundaryTerm < expected.BoundaryTerm {
 		return nil, false
 	}
+	if next.Status != pb.SlotStatus_SlotStatusNormal || next.ExpectLeader != 0 {
+		return nil, false
+	}
+	minimumBoundary := expected.BoundaryTerm
+	identity := rt.ElectionIdentity(slotToRaftConfig(expected))
+	for id, report := range cert.Reports {
+		if report.NodeID == id && report.Identity == identity && report.Fenced && report.Term == next.Term {
+			minimumBoundary = max(minimumBoundary, report.BoundaryTerm)
+		}
+	}
+	if next.BoundaryTerm < minimumBoundary {
+		return nil, false
+	}
 	if err := rt.ValidateMembershipInstall(slotToRaftConfig(expected), slotToRaftConfig(next), cert); err != nil {
 		return nil, false
 	}

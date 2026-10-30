@@ -46,8 +46,8 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 	if rft == nil { // 添加slot的raft
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := s.raftGroup.InitializeRaft(ctx, shardNo, func() (raftgroup.IRaft, error) {
-			return newSlot(slot, s)
+		_, err := s.raftGroup.InitializeRaftWithStorage(ctx, shardNo, func(binding *raftgroup.StorageBinding) (raftgroup.IRaft, error) {
+			return newSlot(slot, s, binding)
 		}, func(candidate raftgroup.IRaft) error {
 			st := candidate.(*Slot)
 			cfg := s.slotToConfig(slot)

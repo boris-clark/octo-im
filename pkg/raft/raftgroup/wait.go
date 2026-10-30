@@ -162,7 +162,11 @@ func (m *wait) verifyStored(w *receiptWaiter) {
 }
 
 func (m *wait) readReceipt(w *receiptWaiter) {
-	result := m.readRange(w.receipt)
+	m.readReceiptWith(w, m.readLog)
+}
+
+func (m *wait) readReceiptWith(w *receiptWaiter, read readLogFunc) {
+	result := m.readRangeWith(w.receipt, read)
 	b := m.bucket(w.raftKey)
 	b.mu.Lock()
 	b.completeLocked(w, result)
@@ -172,12 +176,16 @@ func (m *wait) readReceipt(w *receiptWaiter) {
 // readRange point-reads every index of r's range and verifies it. Any missing
 // or unreadable entry leaves the outcome unknown.
 func (m *wait) readRange(r receipt) error {
-	if m.readLog == nil {
+	return m.readRangeWith(r, m.readLog)
+}
+
+func (m *wait) readRangeWith(r receipt, read readLogFunc) error {
+	if read == nil {
 		return proposalOutcomeUnknown(fmt.Errorf("applied log %d is not readable", r.last))
 	}
 	logs := make([]types.Log, 0, r.last-r.first+1)
 	for index := r.first; index <= r.last; index++ {
-		log, ok, err := m.readLog(r.raftKey, index)
+		log, ok, err := read(r.raftKey, index)
 		if err != nil {
 			return proposalOutcomeUnknown(err)
 		}

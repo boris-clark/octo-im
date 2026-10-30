@@ -77,7 +77,11 @@ func (rg *RaftGroup) ProposeBatchTimeout(ctx context.Context, raftKey string, re
 	if raft == nil {
 		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
 	}
-	if !raft.IsLeader() {
+	isLeader, readErr := rg.proposalIsLeader(ctx, raft)
+	if readErr != nil {
+		return nil, proposalNotAdmitted(readErr)
+	}
+	if !isLeader {
 		r.forwarded = true
 		resps, err := rg.fowardPropose(ctx, raft, reqs, false)
 		return resps, err
@@ -96,6 +100,9 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	var r receipt
 	defer func() { rg.recordOutcome(raftKey, r, err) }()
 	var waiter *receiptWaiter
+	if len(reqs) == 0 {
+		return nil, proposalNotAdmitted(errors.New("raftgroup: empty proposal batch"))
+	}
 	raft := rg.raftList.get(raftKey)
 	if raft == nil {
 		return nil, fmt.Errorf("raft not found, key:%s", raftKey)
@@ -104,7 +111,11 @@ func (rg *RaftGroup) ProposeBatchUntilAppliedTimeout(ctx context.Context, raftKe
 	raft.KeepAlive()
 	lease := rg.raftStorageLease(raft)
 
-	if !raft.IsLeader() {
+	isLeader, readErr := rg.proposalIsLeader(ctx, raft)
+	if readErr != nil {
+		return nil, proposalNotAdmitted(readErr)
+	}
+	if !isLeader {
 		// 如果不是leader，则转发给leader
 		r.forwarded = true
 		resps, err = rg.fowardPropose(ctx, raft, reqs, true)
@@ -308,7 +319,10 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 	if err := ctx.Err(); err != nil {
 		return nil, proposalNotAdmitted(err)
 	}
-	leaderID := raft.LeaderId()
+	leaderID, nodeID, _, err := rg.proposalRoute(ctx, raft)
+	if err != nil {
+		return nil, proposalNotAdmitted(err)
+	}
 	if leaderID == 0 {
 		return nil, proposalNotAdmitted(types.ErrNotLeader)
 	}
@@ -325,7 +339,7 @@ func (rg *RaftGroup) fowardPropose(ctx context.Context, raft IRaft, reqs types.P
 	defer rg.retireForward(key, reg)
 
 	rg.opts.Transport.Send(raft.Key(), types.Event{
-		From: raft.NodeId(),
+		From: nodeID,
 		To:   leaderID,
 		Type: types.SendPropose,
 		Logs: []types.Log{reg.token.log(data)},
@@ -497,4 +511,31 @@ func (rg *RaftGroup) handleSendProposeResp(raftKey string, e types.Event) {
 		return
 	}
 	rg.settleForwardLocked(key, reg, resps)
+}
+
+// proposalRoute samples a routing hint on the owner with cancellation. Before
+// Start, manual embedders are serialized by the same owner mutex.
+func (rg *RaftGroup) proposalRoute(ctx context.Context, r IRaft) (leader, node uint64, isLeader bool, err error) {
+	if rg.stopBegun.Load() {
+		return 0, 0, false, ErrGroupStopped
+	}
+	sample := func(current IRaft) error {
+		if current != r {
+			return ErrRaftNotExist
+		}
+		leader, node, isLeader = r.LeaderId(), r.NodeId(), r.IsLeader()
+		return nil
+	}
+	if !rg.started.Load() && rg.ownerMu.TryLock() {
+		defer rg.ownerMu.Unlock()
+		err = sample(rg.raftList.get(r.Key()))
+	} else {
+		err = rg.Do(ctx, r.Key(), sample)
+	}
+	return
+}
+
+func (rg *RaftGroup) proposalIsLeader(ctx context.Context, r IRaft) (bool, error) {
+	_, _, leader, err := rg.proposalRoute(ctx, r)
+	return leader, err
 }

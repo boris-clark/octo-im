@@ -27,9 +27,8 @@ func TestXin2666E3RawEntriesRefuseDuringDrain(t *testing.T) {
 	p.s.opts.OnApply = func(uint32, []types.Log) error { once.Do(func() { close(entered); <-release }); return nil }
 	tr := &issue87Transport{groups: map[uint64]*raftgroup.RaftGroup{}}
 	g := raftgroup.New(raftgroup.NewOptions(raftgroup.WithStorage(p), raftgroup.WithTransport(tr), raftgroup.WithTickInterval(5*time.Millisecond)))
-	old := issue87Build(t, p, 1, []uint64{1})
-	require.NoError(t, g.AddRaft(old))
 	require.NoError(t, g.Start())
+	old := e3Install(t, p, g)
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	defer func() {
@@ -40,7 +39,9 @@ func TestXin2666E3RawEntriesRefuseDuringDrain(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go func() { _, _ = g.ProposeBatchUntilAppliedTimeout(ctx, key, types.ProposeReqSet{{Id: 100, Data: []byte("old-apply")}}) }()
+	go func() {
+		_, _ = g.ProposeBatchUntilAppliedTimeout(ctx, key, types.ProposeReqSet{{Id: 100, Data: []byte("old-apply")}})
+	}()
 	issue87Await(t, entered)
 	g.RemoveRaft(old)
 	// The key is now retired with an accepted Apply still holding effects.

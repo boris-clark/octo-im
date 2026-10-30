@@ -47,9 +47,8 @@ func TestE3All24EntriesRefusalAndActiveAccess(t *testing.T) {
 	require.ErrorIs(t, err, ErrStorageUnbound)
 	require.ErrorIs(t, err, raftgroup.ErrRaftBusy)
 
-	old := issue87Build(t, p, 1, []uint64{1})
-	require.NoError(t, g.AddRaft(old))
 	require.NoError(t, g.Start())
+	old := e3Install(t, p, g)
 
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
@@ -60,15 +59,15 @@ func TestE3All24EntriesRefusalAndActiveAccess(t *testing.T) {
 		require.NoError(t, p.Close())
 	}()
 
-	// While active, the 4 Server accessors succeed.
-	_, err = p.s.AppliedIndex(1)
-	require.NoError(t, err)
-	_, err = p.s.LastIndex(1)
-	require.NoError(t, err)
-	_, err = p.s.LastLog(1)
-	require.NoError(t, err)
-	_, err = p.s.GetLogsInReverseOrder(1, 0, 1, 1)
-	require.NoError(t, err)
+	// Server convenience reads have nonblocking admission while workers execute.
+	for _, read := range []func() error{
+		func() error { _, e := p.s.AppliedIndex(1); return e },
+		func() error { _, e := p.s.LastIndex(1); return e },
+		func() error { _, e := p.s.LastLog(1); return e },
+		func() error { _, e := p.s.GetLogsInReverseOrder(1, 0, 1, 1); return e },
+	} {
+		require.Eventually(t, func() bool { return read() == nil }, time.Second, time.Millisecond)
+	}
 
 	// Start a proposal and hold OnApply, then retire the instance so it is draining.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -139,6 +138,13 @@ func TestSharedDomainCloseRequiresAllAttachedGroupsQuiescent(t *testing.T) {
 	g1 := raftgroup.New(raftgroup.NewOptions(raftgroup.WithStorage(p), raftgroup.WithTransport(tr), raftgroup.WithTickInterval(5*time.Millisecond)))
 	g2 := raftgroup.New(raftgroup.NewOptions(raftgroup.WithStorage(p), raftgroup.WithTransport(tr), raftgroup.WithTickInterval(5*time.Millisecond)))
 
+	t.Cleanup(func() {
+		g1.Stop()
+		require.NoError(t, g1.WaitQuiescence(context.Background()))
+		g2.Stop()
+		require.NoError(t, g2.WaitQuiescence(context.Background()))
+		require.NoError(t, p.Close())
+	})
 	require.NoError(t, g1.Start())
 	require.NoError(t, g2.Start())
 

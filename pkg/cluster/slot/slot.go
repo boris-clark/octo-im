@@ -2,6 +2,7 @@ package slot
 
 import (
 	"fmt"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
@@ -16,20 +17,31 @@ type Slot struct {
 	wklog.Log
 }
 
-func newSlot(slot *types.Slot, s *Server) (*Slot, error) {
+func newSlot(slot *types.Slot, s *Server, bindings ...*raftgroup.StorageBinding) (*Slot, error) {
 	shardNo := SlotIdToKey(slot.Id)
 	st := &Slot{
 		slot:    slot.Clone(),
 		shardNo: shardNo,
 		Log:     wklog.NewWKLog("slot"),
 	}
-	state, err := s.storage.BoundGetState(shardNo)
+	if len(bindings) != 1 || bindings[0] == nil {
+		return nil, ErrStorageUnbound
+	}
+	binding := bindings[0]
+	var state rafttypes.RaftState
+	var lastLogIndex uint64
+	err := binding.WithStorage(func(call *raftgroup.StorageCall) error {
+		view := s.storage.BindStorage(call).(*storageView)
+		var err error
+		state, err = view.GetState(shardNo)
+		if err != nil {
+			return err
+		}
+		lastLogIndex, err = view.GetTermStartIndex(shardNo, state.LastTerm)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("get slot state: %w", err)
-	}
-	lastLogIndex, err := s.storage.BoundGetTermStartIndex(shardNo, state.LastTerm)
-	if err != nil {
-		return nil, fmt.Errorf("get slot term: %w", err)
 	}
 	if state.Diverged {
 		// The fence is in place before the raft exists, so no read or
@@ -40,7 +52,11 @@ func newSlot(slot *types.Slot, s *Server) (*Slot, error) {
 	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(
 		raft.WithKey(shardNo),
 		raft.WithNodeId(s.opts.NodeId),
-		raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.saveSlotHardState(shardNo, st, state) }),
+		raft.WithSaveHardState(func(state rafttypes.HardState) error {
+			return binding.WithStorage(func(call *raftgroup.StorageCall) error {
+				return s.storage.BindStorage(call).(*storageView).SaveHardState(shardNo, state)
+			})
+		}),
 		// Leader hand-off by role switch keeps the term (learner) or bypasses
 		// the healthy-quorum election; slot leadership changes only by election.
 		raft.WithLeaderRoleSwitchDisabled(true),

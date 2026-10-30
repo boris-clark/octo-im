@@ -47,12 +47,13 @@ type RaftGroup struct {
 	// forwardObserve, if set by a test, sees correlation events under forwardMu.
 	forwardObserve func(key, phase, detail string)
 
-	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
-	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
-	proposalStats proposalStats
-	started       atomic.Bool
-	stopOnce      sync.Once
-	stopBegun     atomic.Bool
+	proposalSeq        atomic.Uint64 // receipt identity, unique within the group
+	admissionSems      sync.Map      // raftKey -> chan struct{}, see admissionSem
+	proposalStats      proposalStats
+	storageDomainError error
+	started            atomic.Bool
+	stopOnce           sync.Once
+	stopBegun          atomic.Bool
 	// loopDone closes once the shutdown lifecycle joined the event loop,
 	// fenced pool submission and settled receipts.
 	loopDone       chan struct{}
@@ -92,7 +93,7 @@ func New(opts *Options) *RaftGroup {
 	}
 	storage := opts.Storage
 	if bs, ok := storage.(BoundStorage); ok {
-		bs.AttachStorageDomain(rg)
+		rg.storageDomainError = bs.AttachStorageDomain(rg)
 	}
 	rg.wait = newWait(func(key string, index uint64) (types.Log, bool, error) { return readStorageLog(storage, key, index) })
 	var err error
@@ -121,6 +122,11 @@ func (rg *RaftGroup) AddRaft(r IRaft) error {
 
 // addRaft runs with ownerMu held.
 func (rg *RaftGroup) addRaft(r IRaft) error {
+	if bs, ok := rg.opts.Storage.(BoundStorage); ok {
+		if err := bs.ClaimStorageKey(rg, r.Key()); err != nil {
+			return err
+		}
+	}
 	rg.storageMu.Lock()
 	if rg.stopBegun.Load() {
 		rg.storageMu.Unlock()
@@ -195,6 +201,12 @@ func (rg *RaftGroup) IsLeader(raftKey string) bool {
 }
 
 func (rg *RaftGroup) Start() error {
+	if rg.storageDomainError != nil {
+		return rg.storageDomainError
+	}
+	if rg.stopBegun.Load() {
+		return ErrGroupStopped
+	}
 	rg.started.Store(true)
 	rg.stopper.RunWorker(rg.loopEvent)
 	return nil
@@ -250,11 +262,7 @@ func readStorageLog(storage IStorage, raftKey string, index uint64) (types.Log, 
 		logs []types.Log
 		err  error
 	)
-	if bs, ok := storage.(BoundStorage); ok {
-		logs, err = bs.BoundGetLogs(raftKey, index, index+1, 0)
-	} else {
-		logs, err = storage.GetLogs(raftKey, index, index+1, 0)
-	}
+	logs, err = storage.GetLogs(raftKey, index, index+1, 0)
 	if err != nil {
 		return types.Log{}, false, err
 	}

@@ -132,11 +132,17 @@ func (s *Server) slotInfos(slotIds []uint32) ([]SlotInfo, error) {
 			s.Error("get slot applied index error", zap.Error(err))
 			continue
 		}
+		ctx, cancel := context.WithTimeout(s.cancelCtx, time.Second)
+		ownerState, err := s.slotServer.ReadLeaderState(ctx, slotId)
+		cancel()
+		if err != nil || !ownerState.Exists {
+			continue
+		}
 		slotInfos = append(slotInfos, SlotInfo{
 			SlotId:   slotId,
 			LogIndex: lastLog.Index,
 			LogTerm:  lastLog.Term,
-			Term:     st.LastTerm(),
+			Term:     ownerState.Term,
 			Diverged: state != slot.ReplicaHealthy,
 			Applied:  applied,
 		})

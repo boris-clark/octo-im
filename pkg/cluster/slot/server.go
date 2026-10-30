@@ -167,31 +167,13 @@ func (s *Server) getSlotId(v string) uint32 {
 }
 
 func (s *Server) withActiveSlotStorage(slotId uint32, fn func(shardNo string) error) error {
-	if s == nil || s.storage == nil {
+	if s == nil || s.storage == nil || s.raftGroup == nil {
 		return ErrStorageUnbound
 	}
-	rg := s.storage.primaryGroup()
-	if rg == nil {
-		return ErrStorageUnbound
-	}
-	shardNo := SlotIdToKey(slotId)
-	return rg.WithActiveStorageLease(shardNo, func() error {
-		return s.storage.withBoundOp(func() error {
-			return fn(shardNo)
-		})
-	})
-}
-
-func (s *Server) saveSlotHardState(shardNo string, slotRaft *Slot, state types.HardState) error {
-	if s == nil || s.storage == nil || slotRaft == nil {
-		return ErrStorageUnbound
-	}
-	rg := s.storage.primaryGroup()
-	if rg == nil {
-		return ErrStorageUnbound
-	}
-	return rg.WithInstanceStorageLease(slotRaft, func() error {
-		return s.storage.BoundSaveHardState(shardNo, state)
+	key := SlotIdToKey(slotId)
+	binding := s.raftGroup.StorageBinding(s.raftGroup.GetRaft(key))
+	return binding.WithStorage(func(call *raftgroup.StorageCall) error {
+		return s.storage.BindStorage(call).(*storageView).with(key, func() error { return fn(key) })
 	})
 }
 

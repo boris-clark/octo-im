@@ -9,6 +9,16 @@ import "context"
 // build must return a fresh, unstarted instance and must not call this group.
 // initialize runs on the owner and has the same restrictions as Do.
 func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func() (IRaft, error), initialize func(IRaft) error) (IRaft, error) {
+	return rg.initializeRaft(ctx, key, func(_ *StorageBinding) (IRaft, error) { return build() }, initialize)
+}
+
+// InitializeRaftWithStorage passes the reservation's immutable binding to build.
+// The binding remains private to this candidate through activation or failure.
+func (rg *RaftGroup) InitializeRaftWithStorage(ctx context.Context, key string, build func(*StorageBinding) (IRaft, error), initialize func(IRaft) error) (IRaft, error) {
+	return rg.initializeRaft(ctx, key, build, initialize)
+}
+
+func (rg *RaftGroup) initializeRaft(ctx context.Context, key string, build func(*StorageBinding) (IRaft, error), initialize func(IRaft) error) (IRaft, error) {
 	if rg.stopBegun.Load() {
 		return nil, ErrGroupStopped
 	}
@@ -27,6 +37,11 @@ func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func(
 	// Owner acknowledgement precedes reconstruction, including synchronous
 	// Ready/HardState effects. No registry lock is held while awaiting it.
 	err := rg.Do(ctx, key, func(current IRaft) error {
+		if bs, ok := rg.opts.Storage.(BoundStorage); ok {
+			if err := bs.ClaimStorageKey(rg, key); err != nil {
+				return err
+			}
+		}
 		rg.verificationMu.Lock()
 		defer rg.verificationMu.Unlock()
 		if rg.verificationStopped {
@@ -58,7 +73,7 @@ func (rg *RaftGroup) InitializeRaft(ctx context.Context, key string, build func(
 	if rg.stopBegun.Load() {
 		return nil, ErrGroupStopped
 	}
-	candidate, err := build()
+	candidate, err := build(&StorageBinding{group: rg, lease: lease, key: key})
 	if err != nil {
 		return nil, err
 	}

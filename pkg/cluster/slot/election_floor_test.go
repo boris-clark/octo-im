@@ -26,7 +26,7 @@ func TestPebbleStaleSampleRetainsExactCommittedIdentityAndRecovery(t *testing.T)
 	for id := uint64(1); id <= 3; id++ {
 		dir := t.TempDir()
 		disk := open(dir)
-		n := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithKey(key), raft.WithNodeId(id), raft.WithReplicas(cfg.Replicas), raft.WithSaveHardState(func(state types.HardState) error { return disk.saveHardState(key, state) })))
+		n := raft.NewNode(0, types.RaftState{}, raft.NewOptions(raft.WithKey(key), raft.WithNodeId(id), raft.WithReplicas(cfg.Replicas), raft.WithSaveHardState(func(state types.HardState) error { return disk.SaveHardState(key, state) })))
 		c := cfg.Clone()
 		c.Role = types.RoleFollower
 		if id == 1 {
@@ -46,7 +46,7 @@ func TestPebbleStaleSampleRetainsExactCommittedIdentityAndRecovery(t *testing.T)
 		}
 		require.Len(t, requests, 1)
 		req := requests[0]
-		require.NoError(t, r.disk.appendLogs(key, req.Logs, req.TermStartIndexInfo))
+		require.NoError(t, r.disk.AppendLogs(key, req.Logs, req.TermStartIndexInfo))
 		require.NoError(t, r.node.Step(types.StoreResponse(req, types.Event{Type: types.StoreResp, Index: req.Logs[len(req.Logs)-1].Index, Logs: req.Logs, Reason: types.ReasonOk})))
 		return req.Logs
 	}
@@ -63,7 +63,7 @@ func TestPebbleStaleSampleRetainsExactCommittedIdentityAndRecovery(t *testing.T)
 			require.NoError(t, nodes[id].node.Step(types.Event{Type: types.Ping, Term: 7, From: 1, CommittedIndex: index}))
 		}
 	}
-	sampled, err := nodes[2].disk.getState(key)
+	sampled, err := nodes[2].disk.GetState(key)
 	require.NoError(t, err)
 	require.EqualValues(t, 9, sampled.LastLogIndex)
 	_, err = nodes[1].node.Admit([]types.Log{{Id: 100, Data: []byte("accepted-before-stale-install")}})
@@ -79,7 +79,7 @@ func TestPebbleStaleSampleRetainsExactCommittedIdentityAndRecovery(t *testing.T)
 	for _, id := range []uint64{1, 3} {
 		r := nodes[id]
 		require.NoError(t, r.node.FenceElection(cfg, 8))
-		state, err := r.disk.getState(key)
+		state, err := r.disk.GetState(key)
 		require.NoError(t, err)
 		require.EqualValues(t, 10, state.HardState.CommittedFloor)
 		reports[id] = types.ElectionReport{NodeID: id, Term: state.HardState.FenceTerm, Fenced: true, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor}
@@ -110,19 +110,19 @@ func TestPebbleStaleSampleRetainsExactCommittedIdentityAndRecovery(t *testing.T)
 	require.EqualValues(t, 11, nodes[1].node.CommittedIndex())
 	for _, id := range []uint64{1, 3} {
 		r := nodes[id]
-		require.ErrorIs(t, r.disk.truncateLogTo(key, 9), types.ErrTruncateBelowApplied)
-		got, err := r.disk.getLogs(key, 10, 11, 0)
+		require.ErrorIs(t, r.disk.TruncateLogTo(key, 9), types.ErrTruncateBelowApplied)
+		got, err := r.disk.GetLogs(key, 10, 11, 0)
 		require.NoError(t, err)
 		require.True(t, types.SameLogs([]types.Log{original}, got))
 	}
 	for id, r := range nodes {
 		require.NoError(t, r.disk.Close())
 		r.disk = open(r.dir)
-		state, err := r.disk.getState(key)
+		state, err := r.disk.GetState(key)
 		require.NoError(t, err)
 		if id == 1 || id == 3 {
 			require.GreaterOrEqual(t, state.HardState.CommittedFloor, uint64(10))
-			got, err := r.disk.getLogs(key, 10, 11, 0)
+			got, err := r.disk.GetLogs(key, 10, 11, 0)
 			require.NoError(t, err)
 			require.True(t, types.SameLogs([]types.Log{original}, got))
 		}
@@ -134,20 +134,20 @@ func TestPebbleTruncationAtomicallyKeepsOnlySurvivingTermRows(t *testing.T) {
 	dir := t.TempDir()
 	p := NewPebbleShardLogStorage(nil, dir, 1)
 	require.NoError(t, p.Open())
-	require.NoError(t, p.appendLogs("1", []types.Log{{Index: 1, Term: 7, Id: 10, Data: []byte("survivor")}}, &types.TermStartIndexInfo{Term: 7, Index: 1}))
-	require.NoError(t, p.appendLogs("1", []types.Log{{Index: 2, Term: 8, Id: 20, Data: []byte("uncommitted")}}, &types.TermStartIndexInfo{Term: 8, Index: 2}))
-	require.NoError(t, p.truncateLogTo("1", 1))
+	require.NoError(t, p.AppendLogs("1", []types.Log{{Index: 1, Term: 7, Id: 10, Data: []byte("survivor")}}, &types.TermStartIndexInfo{Term: 7, Index: 1}))
+	require.NoError(t, p.AppendLogs("1", []types.Log{{Index: 2, Term: 8, Id: 20, Data: []byte("uncommitted")}}, &types.TermStartIndexInfo{Term: 8, Index: 2}))
+	require.NoError(t, p.TruncateLogTo("1", 1))
 	require.NoError(t, p.Close())
 	p = NewPebbleShardLogStorage(nil, dir, 1)
 	require.NoError(t, p.Open())
 	defer p.Close()
-	log, err := p.lastLog("1")
+	log, err := p.LastLog("1")
 	require.NoError(t, err)
 	require.EqualValues(t, 10, log.Id)
-	row, err := p.getTermStartIndex("1", 7)
+	row, err := p.GetTermStartIndex("1", 7)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, row)
-	row, err = p.getTermStartIndex("1", 8)
+	row, err = p.GetTermStartIndex("1", 8)
 	require.NoError(t, err)
 	require.Zero(t, row)
 }
