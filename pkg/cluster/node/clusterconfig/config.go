@@ -86,6 +86,14 @@ func (c *Config) version() uint64 {
 	defer c.mu.RUnlock()
 	return c.cfg.Version
 }
+
+// setAppliedVersion publishes term and version under the snapshot owner lock.
+func (c *Config) setAppliedVersion(term uint32, version uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg.Term, c.cfg.Version = term, version
+}
+
 func (c *Config) setVersion(version uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

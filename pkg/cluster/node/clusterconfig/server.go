@@ -63,12 +63,18 @@ type Server struct {
 	listeners         []IEvent // 事件监听器
 	// Apply-worker-only progress. On restart the persisted snapshot and
 	// initRaft reconstruct membership; these flags cover in-process retries.
-	membershipPending    bool
-	configSavePending    bool
-	configNotifyPending  bool
+	membershipPending   bool
+	configSavePending   bool
+	configNotifyPending bool
+	// proposalCtx is set before Start and cancels waits when the containing owner stops.
+	proposalCtx          context.Context
 	onProposeMigrateSlot func(slotId uint32, fromNodeId, toNodeId uint64) error
 	wklog.Log
 }
+
+// SetProposalContext binds default proposal waits to the containing lifecycle.
+// Call it only during construction, before Start or any proposal.
+func (s *Server) SetProposalContext(ctx context.Context) { s.proposalCtx = ctx }
 
 func (s *Server) SetOnProposeMigrateSlot(fn func(slotId uint32, fromNodeId, toNodeId uint64) error) {
 	s.onProposeMigrateSlot = fn
@@ -286,7 +292,13 @@ func (s *Server) ProposeUntilAppliedTimeout(ctx context.Context, id uint64, data
 }
 
 func (s *Server) ProposeUntilApplied(id uint64, data []byte) (*rafttypes.ProposeResp, error) {
-	return s.raft.ProposeUntilApplied(id, data)
+	parent := s.proposalCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, s.raft.Options().ProposeTimeout)
+	defer cancel()
+	return s.raft.ProposeUntilAppliedTimeout(ctx, id, data)
 }
 
 func (s *Server) ProposeBatchTimeout(ctx context.Context, reqs []rafttypes.ProposeReq) ([]*rafttypes.ProposeResp, error) {

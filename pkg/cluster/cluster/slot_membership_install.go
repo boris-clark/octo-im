@@ -104,7 +104,7 @@ func (s *Server) installCertifiedSlotMembership(ctx context.Context, old, next *
 	return s.cfgServer.ProposeSlotInstallWithMembership(old, candidate, cert)
 }
 
-func (s *Server) slotNodeLogInfo(nodeId uint64, slotId uint32) (SlotInfo, bool) {
+func (s *Server) slotNodeLogInfo(ctx context.Context, nodeId uint64, slotId uint32) (SlotInfo, bool) {
 	if nodeId == s.opts.ConfigOptions.NodeId {
 		infos, err := s.slotInfos([]uint32{slotId})
 		if err != nil || len(infos) == 0 || infos[0].Diverged {
@@ -112,7 +112,15 @@ func (s *Server) slotNodeLogInfo(nodeId uint64, slotId uint32) (SlotInfo, bool) 
 		}
 		return infos[0], true
 	}
-	resp, err := s.rpcClient.RequestSlotLastLogInfo(nodeId, &SlotLogInfoReq{SlotIds: []uint32{slotId}})
+	data, err := (&SlotLogInfoReq{SlotIds: []uint32{slotId}}).Marshal()
+	if err != nil {
+		return SlotInfo{}, false
+	}
+	body, err := s.rpcClient.requestWithContext(ctx, nodeId, "/rpc/slot/lastLogInfo", data)
+	resp := &SlotLogInfoResp{}
+	if err == nil {
+		err = resp.Unmarshal(body)
+	}
 	if err != nil || resp == nil || len(resp.Slots) == 0 || resp.Slots[0].Diverged {
 		return SlotInfo{}, false
 	}
@@ -123,7 +131,7 @@ func (s *Server) ensureSlotCurrentTermApplied(ctx context.Context, st *pb.Slot) 
 	if st == nil || st.Leader == 0 {
 		return SlotInfo{}, false
 	}
-	leaderInfo, ok := s.slotNodeLogInfo(st.Leader, st.Id)
+	leaderInfo, ok := s.slotNodeLogInfo(ctx, st.Leader, st.Id)
 	if !ok {
 		return SlotInfo{}, false
 	}
@@ -131,7 +139,7 @@ func (s *Server) ensureSlotCurrentTermApplied(ctx context.Context, st *pb.Slot) 
 		proposeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_, _ = s.slotServer.ProposeUntilAppliedTimeout(proposeCtx, st.Id, rt.NoopData())
 		cancel()
-		leaderInfo, ok = s.slotNodeLogInfo(st.Leader, st.Id)
+		leaderInfo, ok = s.slotNodeLogInfo(ctx, st.Leader, st.Id)
 		if !ok {
 			return SlotInfo{}, false
 		}
@@ -158,7 +166,7 @@ func (s *Server) waitSlotTargetCaughtUp(ctx context.Context, slotId uint32, from
 		}
 		leaderInfo, ok := s.ensureSlotCurrentTermApplied(ctx, current)
 		if ok {
-			targetInfo, ok2 := s.slotNodeLogInfo(toNodeId, slotId)
+			targetInfo, ok2 := s.slotNodeLogInfo(ctx, toNodeId, slotId)
 			if ok2 && targetInfo.LogTerm == leaderInfo.LogTerm && targetInfo.LogIndex == leaderInfo.LogIndex && targetInfo.Applied >= leaderInfo.Applied {
 				return current, nil
 			}
@@ -279,7 +287,7 @@ func (s *Server) tryCompleteSlotMigration(ctx context.Context, slotId uint32) er
 	if !ok {
 		return ErrConversationReadRetry
 	}
-	learnerInfo, ok := s.slotNodeLogInfo(current.MigrateTo, slotId)
+	learnerInfo, ok := s.slotNodeLogInfo(ctx, current.MigrateTo, slotId)
 	if !ok || learnerInfo.LogTerm != leaderInfo.LogTerm || learnerInfo.LogIndex != leaderInfo.LogIndex || learnerInfo.Applied < leaderInfo.Applied {
 		return ErrConversationReadRetry
 	}

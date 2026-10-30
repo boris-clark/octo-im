@@ -141,6 +141,7 @@ func New(opts *Options) *Server {
 	// 节点分布式配置服务
 	s.cfgServer = clusterconfig.New(opts.ConfigOptions)
 	s.cfgServer.SetOnProposeMigrateSlot(s.proposeMigrateSlot)
+	s.cfgServer.SetProposalContext(s.cancelCtx)
 
 	//节点事件服务
 	s.eventServer = event.NewServer(s, opts.ConfigOptions, s.cfgServer)
@@ -283,6 +284,11 @@ func (s *Server) Stop() error {
 // lifecycles and closes the shared DB once every owner has quiesced.
 func (s *Server) StopWithContext(ctx context.Context) error {
 	s.stopBegin.Do(func() {
+		// Fence proposal/RPC waits before joining their workers; storage remains
+		// owned until the unchanged shutdown sequence collects every owner.
+		if s.cancelFnc != nil {
+			s.cancelFnc()
+		}
 		// The reconciler can be inside a synchronous page read, and the join
 		// worker inside an RPC with its own timeout. Join them in one tracked
 		// lifecycle so ctx bounds the wait while storage stays owned.

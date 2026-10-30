@@ -42,8 +42,7 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 		after := s.configToRaftConfig(s.config)
 		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
-		s.config.cfg.Term = log.Term
-		s.config.cfg.Version = log.Index
+		s.config.setAppliedVersion(log.Term, log.Index)
 		s.configSavePending = true
 		s.configNotifyPending = true
 	}
