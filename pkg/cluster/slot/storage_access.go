@@ -165,6 +165,9 @@ func (v *storageView) DivergedMarker(key string) (bool, error) {
 
 // CallbackReads is a read-only scope of an already accepted storage call.
 // It is revoked and joined before its callback returns to Apply or SaveConfig.
+// The parent call already owns the effect gate and domain admission until that
+// join. Reads use private primitives so revoking the parent cannot deadlock on a
+// nested read lock, and the Apply slot lock remains held throughout.
 type CallbackReads struct {
 	mu     sync.RWMutex
 	active bool
@@ -178,7 +181,7 @@ func (r *CallbackReads) with(fn func() error) error {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if !r.active {
+	if !r.active || r.view == nil || r.view.p == nil {
 		return ErrStorageUnbound
 	}
 	return fn()
@@ -187,13 +190,13 @@ func (r *CallbackReads) revoke() { r.mu.Lock(); r.active = false; r.mu.Unlock() 
 
 func (r *CallbackReads) GetState() (types.RaftState, error) {
 	var a0 types.RaftState
-	err := r.with(func() error { var err error; a0, err = r.view.GetState(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.getState(r.key); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) GetLogs(start, end, limit uint64) ([]types.Log, error) {
 	var a0 []types.Log
-	err := r.with(func() error { var err error; a0, err = r.view.GetLogs(r.key, start, end, limit); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.getLogs(r.key, start, end, limit); return err })
 	return a0, err
 }
 
@@ -201,7 +204,7 @@ func (r *CallbackReads) GetLogsInReverseOrder(start, end uint64, limit int) ([]t
 	var a0 []types.Log
 	err := r.with(func() error {
 		var err error
-		a0, err = r.view.GetLogsInReverseOrder(r.key, start, end, limit)
+		a0, err = r.view.p.getLogsInReverseOrder(r.key, start, end, limit)
 		return err
 	})
 	return a0, err
@@ -209,49 +212,49 @@ func (r *CallbackReads) GetLogsInReverseOrder(start, end uint64, limit int) ([]t
 
 func (r *CallbackReads) LastIndex() (uint64, error) {
 	var a0 uint64
-	err := r.with(func() error { var err error; a0, err = r.view.LastIndex(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.lastIndex(r.key); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) LastIndexAndTerm() (uint64, uint32, error) {
 	var a0 uint64
 	var a1 uint32
-	err := r.with(func() error { var err error; a0, a1, err = r.view.LastIndexAndTerm(r.key); return err })
+	err := r.with(func() error { var err error; a0, a1, err = r.view.p.lastIndexAndTerm(r.key); return err })
 	return a0, a1, err
 }
 
 func (r *CallbackReads) LastLog() (types.Log, error) {
 	var a0 types.Log
-	err := r.with(func() error { var err error; a0, err = r.view.LastLog(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.lastLog(r.key); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) AppliedIndex() (uint64, error) {
 	var a0 uint64
-	err := r.with(func() error { var err error; a0, err = r.view.AppliedIndex(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.appliedIndex(r.key); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) LeaderLastLogTerm() (uint32, error) {
 	var a0 uint32
-	err := r.with(func() error { var err error; a0, err = r.view.LeaderLastLogTerm(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.leaderLastLogTerm(r.key); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) GetTermStartIndex(term uint32) (uint64, error) {
 	var a0 uint64
-	err := r.with(func() error { var err error; a0, err = r.view.GetTermStartIndex(r.key, term); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.getTermStartIndex(r.key, term); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) LeaderTermGreaterEqThan(term uint32) (uint32, error) {
 	var a0 uint32
-	err := r.with(func() error { var err error; a0, err = r.view.LeaderTermGreaterEqThan(r.key, term); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.leaderTermGreaterEqThan(r.key, term); return err })
 	return a0, err
 }
 
 func (r *CallbackReads) DivergedMarker() (bool, error) {
 	var a0 bool
-	err := r.with(func() error { var err error; a0, err = r.view.DivergedMarker(r.key); return err })
+	err := r.with(func() error { var err error; a0, err = r.view.p.divergedMarker(r.key); return err })
 	return a0, err
 }

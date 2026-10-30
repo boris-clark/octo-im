@@ -380,15 +380,38 @@ func (s *Server) resumeSlotAfterRejectedMembership(ctx context.Context, old *pb.
 	}
 	cfg := slotElectionConfig(old)
 	identity := rt.ElectionIdentity(cfg)
-	valid := make(map[uint64]rt.ElectionReport)
-	for id, r := range reports {
-		if r.Identity == identity && r.NodeID == id && r.Fenced && r.Term == term {
-			valid[id] = r
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	var leader uint64
+	for {
+		valid := make(map[uint64]rt.ElectionReport)
+		for id, r := range reports {
+			if r.Identity == identity && r.NodeID == id && r.Fenced && r.Term == term {
+				valid[id] = r
+			}
 		}
-	}
-	leader, err := rt.SelectFencedLeader(cfg, term, valid)
-	if err != nil {
-		return err
+		var err error
+		leader, err = rt.SelectFencedLeader(cfg, term, valid)
+		if err == nil {
+			reports = valid
+			break
+		}
+		// A refusal or lost reply can follow a successful fence on the old
+		// leader. Retrying the ordinary catch-up path would then wait for
+		// replication from that fenced leader forever. Recollect the same
+		// identity and term within this attempt's existing context instead.
+		if applied := s.cfgServer.AppliedSlot(old.Id); applied == nil || !proto.Equal(applied, old) {
+			return raft.ErrConfigVersionStale
+		}
+		reports, err = s.requestElectionFences(ctx, cfg, electionFenceRequest{Slot: old, Term: term})
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 	next := old.Clone()
 	next.Leader = leader
@@ -396,7 +419,7 @@ func (s *Server) resumeSlotAfterRejectedMembership(ctx context.Context, old *pb.
 	next.InstalledTerm = term
 	next.Status = pb.SlotStatus_SlotStatusNormal
 	next.ExpectLeader = 0
-	for _, r := range valid {
+	for _, r := range reports {
 		next.BoundaryTerm = max(next.BoundaryTerm, r.BoundaryTerm)
 	}
 	return s.cfgServer.ProposeSlotInstallWithMembershipContext(ctx, old, next, nil)

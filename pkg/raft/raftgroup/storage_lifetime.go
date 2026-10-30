@@ -131,6 +131,8 @@ type storageOperation struct {
 	key         string
 	request     types.Event
 	once        sync.Once
+	effectOnce  sync.Once
+	effectHeld  bool // Set by the accepted worker before enabling access.
 	effectsDone bool
 	disposed    bool
 }
@@ -193,11 +195,10 @@ func (rg *RaftGroup) submitStorageOperation(op *storageOperation, fn func()) err
 	err := rg.submit(func() {
 		defer rg.finishStorageEffects(op)
 		op.lease.effect.Lock()
-		defer op.lease.effect.Unlock()
+		op.effectHeld = true
 		op.access.mu.Lock()
 		op.access.active = true
 		op.access.mu.Unlock()
-		defer op.access.revoke()
 		fn()
 	})
 	if err != nil {
@@ -206,7 +207,21 @@ func (rg *RaftGroup) submitStorageOperation(op *storageOperation, fn func()) err
 	return err
 }
 
+// releaseStorageEffectGate revokes and joins entered calls before releasing the
+// original lease's gate. Completion and worker cleanup may both reach it; only
+// the first call may unlock, even if a new operation has since acquired the gate.
+// It runs on the accepted worker, or after submission was refused (no worker).
+func (rg *RaftGroup) releaseStorageEffectGate(op *storageOperation) {
+	op.effectOnce.Do(func() {
+		op.access.revoke()
+		if op.effectHeld {
+			op.lease.effect.Unlock()
+		}
+	})
+}
+
 func (rg *RaftGroup) finishStorageEffects(op *storageOperation) {
+	rg.releaseStorageEffectGate(op)
 	rg.storageMu.Lock()
 	defer rg.storageMu.Unlock()
 	op.effectsDone = true
@@ -247,7 +262,11 @@ func (rg *RaftGroup) completeStorageOperation(op *storageOperation, e types.Even
 		if e.TermStartIndexInfo != nil {
 			e.TermStartIndexInfo = e.TermStartIndexInfo.Clone()
 		}
+		// The copied result is terminal: no later storage access through this
+		// operation is permitted. Pending disposition still owns the lease.
+		rg.releaseStorageEffectGate(op)
 		rg.storageMu.Lock()
+		op.effectsDone = true
 		stopped := rg.stopBegun.Load()
 		if stopped {
 			op.disposed = true
