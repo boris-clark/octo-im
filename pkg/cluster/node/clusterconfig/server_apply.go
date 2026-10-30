@@ -42,8 +42,7 @@ func (s *Server) applyLog(log types.Log) error {
 		}
 		after := s.configToRaftConfig(s.config)
 		s.membershipPending = s.membershipPending || !sameRaftMembership(before, after)
-		s.config.cfg.Term = log.Term
-		s.config.cfg.Version = log.Index
+		s.config.setAppliedVersion(log.Term, log.Index)
 		s.configSavePending = true
 		s.configNotifyPending = true
 	}
@@ -73,6 +72,8 @@ func (s *Server) applyLog(log types.Log) error {
 
 func (s *Server) handleCmd(cmd *CMD) error {
 	switch cmd.CmdType {
+	case CMDTypeSlotInstall:
+		return s.handleSlotInstall(cmd)
 	case CMDTypeConfigChange: // 配置改变
 		return s.handleConfigChange(cmd)
 	case CMDTypeConfigApiServerAddrChange: // 节点api server地址改变

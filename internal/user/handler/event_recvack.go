@@ -14,6 +14,8 @@ import (
 
 // 客户端收到消息后的回执
 func (h *Handler) recvack(event *eventbus.Event) {
+	currentTrace := trace.GetGlobalTrace()
+
 	recvackPacket := event.Frame.(*wkproto.RecvackPacket)
 	persist := !recvackPacket.NoPersist // 是否需要持久化
 	conn := event.Conn
@@ -32,8 +34,8 @@ func (h *Handler) recvack(event *eventbus.Event) {
 	// 记录消息路径
 	event.Track.Record(track.PositionUserRecvack)
 
-	trace.GlobalTrace.Metrics.App().RecvackPacketCountAdd(1)
-	trace.GlobalTrace.Metrics.App().RecvackPacketBytesAdd(recvackPacket.GetFrameSize())
+	currentTrace.Metrics.App().RecvackPacketCountAdd(1)
+	currentTrace.Metrics.App().RecvackPacketBytesAdd(recvackPacket.GetFrameSize())
 
 	isCmd := recvackPacket.SyncOnce                           // 是命令消息
 	isMaster := conn.DeviceLevel == wkproto.DeviceLevelMaster // 是master设备，只有master设备才能擦除指令消息

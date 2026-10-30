@@ -36,14 +36,19 @@ type Node struct {
 	cfg                types.Config // 分布式配置
 	voteFor            uint64       // 本任期的投票，不随角色重置
 	persistedHardState types.HardState
+	safetyState        types.HardState
 	membershipRequests map[uint64]uint64 // peer -> newer applied config version requested
 	applyFailures      int
 	applyRetryTicks    int // only Tick advances retries; role changes do not reset it
 	electionState          // 选举状态
 	syncState              // 同步状态
 	// 最新的任期对应的开始日志下标
-	lastTermStartIndex types.TermStartIndexInfo
-	onlySync           bool // 是否只同步,不做截断判断
+	lastTermStartIndex         types.TermStartIndexInfo
+	pendingCommit              uint64
+	pendingStore               *types.StoreOperation
+	pendingStoreRevision       uint64
+	pendingStoreTermStartIndex *types.TermStartIndexInfo
+	onlySync                   bool // 是否只同步,不做截断判断
 	// softState softState // 软状态
 	sync.Mutex
 	truncating  bool // 截断中
@@ -66,6 +71,7 @@ type Node struct {
 }
 
 func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Options) *Node {
+	raftState.Diverged = raftState.Diverged || raftState.HardState.Quarantined
 	n := &Node{
 		opts: opts,
 		Log:  wklog.NewWKLog(fmt.Sprintf("raft.node[%s]", opts.Key)),
@@ -90,8 +96,15 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 		n.voteFor = raftState.HardState.Vote
 	}
 	n.persistedHardState = raftState.HardState
+	n.safetyState = raftState.HardState
 	// 初始化日志队列
 	n.queue = newQueue(opts.Key, raftState.AppliedIndex, raftState.LastLogIndex)
+	if opts.SaveHardState != nil {
+		// Applied history does not manufacture an authenticated commit floor.
+		n.queue.committedIndex = raftState.HardState.CommittedFloor
+	} else {
+		n.queue.committedIndex = max(n.queue.committedIndex, raftState.HardState.CommittedFloor)
+	}
 
 	// 初始化选举状态
 	n.votes = make(map[uint64]bool)
@@ -116,7 +129,7 @@ func NewNode(lastTermStartLogIndex uint64, raftState types.RaftState, opts *Opti
 		return n
 	}
 
-	if onlySelf {
+	if onlySelf && !n.fenceEnabled() {
 		if n.cfg.Term == 0 {
 			n.cfg.Term = 1
 		}
@@ -151,6 +164,9 @@ func (n *Node) LastTerm() uint32 {
 
 // HasReady 是否有待处理的事件
 func (n *Node) HasReady() bool {
+	if n.pendingCommit > n.queue.committedIndex {
+		return true
+	}
 	if n.hasUnpersistedHardState() {
 		return true
 	}
@@ -173,6 +189,13 @@ func (n *Node) Suspend() bool {
 
 // Ready 获取待处理的事件
 func (n *Node) Ready() []types.Event {
+	if n.pendingCommit > n.queue.committedIndex {
+		index := n.pendingCommit
+		if !n.persistCommit(index) {
+			return nil
+		}
+		n.queue.committedIndex = index
+	}
 	// Persist before releasing ANY event, including self-votes and log writes.
 	// On failure retain the events and retry on the next tick. No vote response
 	// or leader read may escape with an unrecorded term/vote.
@@ -193,19 +216,34 @@ func (n *Node) Ready() []types.Event {
 	}
 
 	if !n.storeHeldForTruncate() && n.queue.hasNextStoreLogs() {
-		logs := n.queue.nextStoreLogs(0)
-		if len(logs) > 0 {
-			var termStartIndexInfo *types.TermStartIndexInfo
-			for _, log := range logs {
-				if n.lastTermStartIndex.Term != log.Term || log.Index == 1 {
-					termStartIndexInfo = &types.TermStartIndexInfo{
-						Term:  log.Term,
-						Index: log.Index,
-					}
-					n.updateLastTermStartIndex(log.Term, log.Index)
+		logs := n.queue.nextStoreLogs(int(n.opts.MaxLogCountPerBatch))
+		if limit := n.opts.MaxStoreBatchBytes; limit > 0 {
+			var size uint64
+			for i := range logs {
+				entrySize := uint64(logs[i].LogSize())
+				if i > 0 && (size >= limit || entrySize > limit-size) {
+					logs = logs[:i]
 					break
 				}
+				size += entrySize
 			}
+		}
+		if len(logs) > 0 {
+			// The storage contract carries one term row per atomic append.
+			// Split before a second transition; publish only a durable prefix.
+			var termStartIndexInfo *types.TermStartIndexInfo
+			lastTerm := n.lastTermStartIndex.Term
+			for i, log := range logs {
+				if lastTerm != log.Term || log.Index == 1 {
+					if termStartIndexInfo != nil {
+						logs = logs[:i]
+						break
+					}
+					termStartIndexInfo = &types.TermStartIndexInfo{Term: log.Term, Index: log.Index}
+					lastTerm = log.Term
+				}
+			}
+			n.pendingStoreTermStartIndex = termStartIndexInfo
 			n.sendStoreReq(logs, termStartIndexInfo)
 		}
 	}

@@ -36,10 +36,10 @@ type conn struct {
 	addr        string // 服务端地址
 	gcMu        sync.RWMutex
 	gc          gnet.Conn
-	idleTick    int // 空闲tick数
-	timeoutTick int
+	idleTick    atomic.Int64 // Idle ticks shared by the ticker and traffic workers.
+	timeoutTick atomic.Int64
 
-	no string // 唯一编号，每次重连都会变
+	no atomic.String // Connection generation shared with close callbacks.
 
 	wklog.Log
 }
@@ -96,14 +96,15 @@ func (c *conn) startDial() {
 		proto = "tcp"
 		addr = c.addr
 	}
-	c.no = wkutil.GenUUID()
+	generation := wkutil.GenUUID()
+	c.no.Store(generation)
 	old := c.replaceTransport(nil)
 	if old != nil {
 		_ = old.Close()
 	}
 
 	gc, err := c.c.cli.DialContext(proto, addr, connCtx{
-		no: c.no,
+		no: generation,
 	})
 	if err != nil {
 		// c.Foucs("conn failed", zap.Error(err))
@@ -172,17 +173,17 @@ func (c *conn) sendAuth() error {
 }
 
 func (c *conn) tick() {
-	c.idleTick++
+	idle := c.idleTick.Inc()
 
 	// 定时发送心跳
-	if c.idleTick >= c.c.opts.HeartbeatTick {
-		c.idleTick = 0
+	if idle >= int64(c.c.opts.HeartbeatTick) {
+		c.idleTick.Store(0)
 		c.sendHeartbeat()
 	}
 
-	c.timeoutTick++
-	if c.timeoutTick >= c.c.opts.HeartbeatTimeoutTick {
-		c.timeoutTick = 0
+	timeout := c.timeoutTick.Inc()
+	if timeout >= int64(c.c.opts.HeartbeatTimeoutTick) {
+		c.timeoutTick.Store(0)
 		c.Foucs("node client heartbeat timeout,reconnect")
 		c.reconnect()
 	}

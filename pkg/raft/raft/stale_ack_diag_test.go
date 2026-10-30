@@ -287,7 +287,7 @@ func (g *saCluster) local(r *saReplica, e types.Event) {
 		for _, l := range e.Logs {
 			r.store[l.Index] = l
 		}
-		g.step(r.id, types.Event{Type: types.StoreResp, Index: e.Logs[len(e.Logs)-1].Index, Reason: types.ReasonOk})
+		g.step(r.id, types.StoreResponse(e, types.Event{Type: types.StoreResp, Index: e.Logs[len(e.Logs)-1].Index, Logs: e.Logs, Reason: types.ReasonOk}))
 	case types.ApplyReq:
 		g.step(r.id, types.Event{Type: types.ApplyResp, Index: e.EndIndex - 1, Reason: types.ReasonOk})
 	case types.GetLogsReq:

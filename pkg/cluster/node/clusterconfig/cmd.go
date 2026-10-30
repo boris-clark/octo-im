@@ -22,7 +22,7 @@ const (
 	CMDTypeSlotUpdate                        // 槽更新
 	CMDTypeNodeStatusChange                  // 节点状态改变
 	CMDTypeSlotStatusChange                  // 槽状态改变
-
+	CMDTypeSlotInstall
 )
 
 func (c CMDType) Uint16() uint16 {

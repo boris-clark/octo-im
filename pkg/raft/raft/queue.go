@@ -10,8 +10,9 @@ import (
 )
 
 type queue struct {
-	logs     []types.Log
-	revision uint64 // owner-only generation of appended/replaced/truncated log content
+	logs            []types.Log
+	storageRevision uint64 // invalidates outstanding storage ranges on truncation
+	revision        uint64 // owner-only generation of appended/replaced/truncated log content
 	wklog.Log
 
 	// 存储日志偏移下标，比如日志 1 2 3 4 5 6 7 8 9，存储的日志偏移是6 表示1 2 3 4 5 6已经存储
@@ -296,6 +297,7 @@ func (r *queue) appliedTo(index uint64) {
 
 // truncateLogTo 截取日志到指定日志下标，比如truncateLogTo(6)，如果日志是1 2 3 4 5 6 7 8 9，截取后是1 2 3 4 5 6
 func (r *queue) truncateLogTo(logIndex uint64) {
+	r.storageRevision++
 	r.revision++
 
 	if logIndex > r.lastLogIndex {

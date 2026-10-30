@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
@@ -62,12 +64,11 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 			return wkdb.EmptyChannelClusterConfig, err
 		}
 
-		version, err := s.saveChannelConfig(ctx, cfg)
+		_, err := s.saveChannelConfig(ctx, cfg)
 		if err != nil {
 			return wkdb.EmptyChannelClusterConfig, err
 		}
-		cfg.ConfVersion = version
-		return cfg, nil
+		return s.loadConversationConfigLocal(ctx, channelId, channelType)
 	}
 
 	return s.maintainChannelConfig(ctx, cfg)
@@ -77,6 +78,11 @@ func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, cha
 // only after election succeeds, then use the same version-fenced write as role
 // callbacks. A competing writer or ownership change makes this attempt retry.
 func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.ChannelClusterConfig) (wkdb.ChannelClusterConfig, error) {
+	key := wkutil.ChannelToKey(current.ChannelId, current.ChannelType)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
+	defer s.channelInstallLock.Unlock(key)
 	if err := ctx.Err(); err != nil {
 		return current, err
 	}
@@ -85,19 +91,21 @@ func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.Channel
 	if err != nil {
 		return current, err
 	}
-	membersChanged, err := s.joinNewRepliceIfNeed(&cfg)
+	membersChanged := false
+	if !leaderChanged {
+		membersChanged, err = s.joinNewRepliceIfNeed(&cfg)
+	}
 	if err != nil {
 		return current, err
 	}
 	if !leaderChanged && !membersChanged {
 		return current, nil
 	}
-	version, err := s.saveChannelConfig(ctx, cfg)
+	_, err = s.saveChannelConfigLocked(ctx, cfg)
 	if err != nil {
 		return current, err
 	}
-	cfg.ConfVersion = version
-	return cfg, nil
+	return s.loadConversationConfigLocal(ctx, cfg.ChannelId, cfg.ChannelType)
 }
 
 // 视情况是否需要加入新的副本
@@ -151,25 +159,63 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 
 // 视情况是否需要变更领导节点
 func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelClusterConfig) (bool, error) {
-	if cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) {
+	// Establish the durable boundary while a legacy leader can still witness
+	// its history. Waiting until that leader disappears strands healthy stores
+	// at the legacy selector's deliberately conservative failover gate.
+	if cfg.InstalledTerm != 0 && cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) {
+		return false, nil
+	}
+	if cfg.InstalledTerm == 0 && cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) &&
+		(len(cfg.Learners) != 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 ||
+			len(cfg.Replicas) < int(cfg.ReplicaMaxCount) && len(s.cfgServer.AllowVoteAndJoinedOnlineNodes()) > len(cfg.Replicas)) {
+		// Finish an existing legacy expansion before freezing its install
+		// identity. Otherwise its already-running promotion callbacks would be
+		// rejected halfway through the persisted membership transition.
 		return false, nil
 	}
 
-	// 获得在线的副本
-	onlineRepics := make([]uint64, 0, len(cfg.Replicas))
-	for _, replicaId := range cfg.Replicas {
-		if s.cfgServer.NodeIsOnline(replicaId) {
-			onlineRepics = append(onlineRepics, replicaId)
-		}
-	}
+	expected := cfg.Clone()
+	return s.fenceChannelConfig(ctx, cfg, expected.Term+1)
+}
 
-	// 获得在线的副本的最新日志信息
-	replicaLastLogInfos, err := s.requestChannelLastLogInfos(ctx, onlineRepics, cfg.ChannelId, cfg.ChannelType)
+// fenceChannelConfig selects only from durable reports for this exact applied
+// identity. A recovered hard-state term may require skipping unused terms.
+func (s *Server) fenceChannelConfig(ctx context.Context, cfg *wkdb.ChannelClusterConfig, term uint32) (bool, error) {
+	expected := cfg.Clone()
+	if term <= expected.Term {
+		return false, ErrConversationReadRetry
+	}
+	current, err := s.loadConversationConfigLocal(ctx, expected.ChannelId, expected.ChannelType)
 	if err != nil {
-		s.Error("requestChannelLastLogInfos failed", zap.Error(err))
 		return false, err
 	}
-	return electChannelLeader(cfg, replicaLastLogInfos)
+	if expected.Id == 0 {
+		expected.Id = current.Id
+	}
+	if !current.Equal(expected) {
+		return false, raft.ErrConfigVersionStale
+	}
+	reports, err := s.requestElectionFences(ctx, channelElectionConfig(expected), electionFenceRequest{Channel: &expected, Term: term})
+	if err != nil {
+		return false, err
+	}
+	leader, err := rafttypes.SelectFencedLeader(channelElectionConfig(expected), term, reports)
+	if err != nil {
+		if current, readErr := s.loadConversationConfigLocal(ctx, expected.ChannelId, expected.ChannelType); readErr == nil && !current.Equal(expected) {
+			return false, raft.ErrConfigVersionStale
+		}
+		return false, fmt.Errorf("%w: %w", ErrConversationReadRetry, err)
+	}
+	cfg.LeaderId = leader
+	cfg.Term = term
+	cfg.InstalledTerm = cfg.Term
+	for _, report := range reports {
+		if report.Fenced && report.Term == term {
+			cfg.BoundaryTerm = max(cfg.BoundaryTerm, report.BoundaryTerm)
+		}
+	}
+	cfg.Expected = &expected
+	return true, nil
 }
 
 // Only current voting replicas count. Desired capacity and learners do not
@@ -276,6 +322,7 @@ func (s *Server) createChannelClusterConfig(channelId string, channelType uint8)
 		ChannelType:     channelType,
 		ReplicaMaxCount: uint16(s.opts.ConfigOptions.ChannelMaxReplicaCount),
 		Term:            1,
+		InstalledTerm:   1,
 		LeaderId:        s.opts.ConfigOptions.NodeId,
 		CreatedAt:       &createdAt,
 		UpdatedAt:       &updatedAt,

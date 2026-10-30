@@ -87,6 +87,8 @@ func (v *varz) Settings(c *wkhttp.Context) {
 }
 
 func CreateVarz(s *Server) *Varz {
+	currentTrace := trace.GetGlobalTrace()
+
 	var rss, vss int64 // rss内存 vss虚拟内存
 	var pcpu float64   // cpu
 	err := pse.ProcUsage(&pcpu, &rss, &vss)
@@ -96,7 +98,7 @@ func CreateVarz(s *Server) *Varz {
 	opts := options.G
 	connCount := service.ConnManager.ConnCount()
 
-	app := trace.GlobalTrace.Metrics.App()
+	app := currentTrace.Metrics.App()
 	inMsgs := app.SendPacketCount() + app.SendackPacketCount() + app.RecvackPacketCount() + app.PingBytes() + app.ConnPacketCount()
 	outMsgs := app.RecvPacketCount() + app.RecvackPacketCount() + app.PongBytes() + app.ConnackPacketCount()
 	inBytes := app.SendPacketBytes() + app.SendackPacketBytes() + app.RecvackPacketBytes() + app.PingBytes() + app.ConnPacketBytes()

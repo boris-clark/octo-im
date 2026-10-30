@@ -202,6 +202,9 @@ const (
 )
 
 type Event struct {
+	// storeOperation and storeResult exist only on the local storage route.
+	storeOperation *StoreOperation
+	storeResult    *storeResult
 	// Type 事件类型
 	Type EventType
 	// From 事件发起者
@@ -356,8 +359,9 @@ func (e Event) Marshal() ([]byte, error) {
 }
 
 func (e *Event) Unmarshal(data []byte) error {
-	// Provenance is local only; a decoded event never carries a verdict.
-	e.storageVerdict = StorageVerdictNone
+	// Clear absent wire fields as well as every local capability on reuse,
+	// including when decoding subsequently fails.
+	*e = Event{}
 	dec := wkproto.NewDecoder(data)
 	flag, err := dec.Uint32()
 	if err != nil {
@@ -703,19 +707,24 @@ MigrateFrom为leader节点的id，MigrateTo的值为follower的id，Learners不�
 **/
 
 type Config struct {
-	MigrateFrom uint64   // 迁移源节点，如果值为leader的ID，表示 learner -> leader ，如果值为follower的ID，表示learner -> follower
-	MigrateTo   uint64   // 迁移目标节点
-	Replicas    []uint64 // 副本集合（包含节点自己,leader + follower，不包含learner， learner在Learners字段里）
-	Learners    []uint64 // 学习节点集合
-	Role        Role     // 节点角色
-	Term        uint32   // 领导任期
-	Version     uint64   // 配置版本
-	Leader      uint64   // 领导ID
+	// InstalledTerm is supplied only by an applied conditional configuration install.
+	InstalledTerm uint32
+	BoundaryTerm  uint32
+	FenceEnabled  bool
+	MigrateFrom   uint64   // 迁移源节点，如果值为leader的ID，表示 learner -> leader ，如果值为follower的ID，表示learner -> follower
+	MigrateTo     uint64   // 迁移目标节点
+	Replicas      []uint64 // 副本集合（包含节点自己,leader + follower，不包含learner， learner在Learners字段里）
+	Learners      []uint64 // 学习节点集合
+	Role          Role     // 节点角色
+	Term          uint32   // 领导任期
+	Version       uint64   // 配置版本
+	Leader        uint64   // 领导ID
 }
 
 // Clone 返回 Config 结构体的一个深拷贝
 func (c Config) Clone() Config {
 	return Config{
+		InstalledTerm: c.InstalledTerm, BoundaryTerm: c.BoundaryTerm, FenceEnabled: c.FenceEnabled,
 		MigrateFrom: c.MigrateFrom,
 		MigrateTo:   c.MigrateTo,
 		Replicas:    append([]uint64{}, c.Replicas...), // 深拷贝切片

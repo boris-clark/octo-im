@@ -22,6 +22,8 @@ func newSlotTransport(s *Server) *slotTransport {
 }
 
 func (s *slotTransport) Send(key string, event types.Event) {
+	currentTrace := trace.GetGlobalTrace()
+
 	to := event.To
 	if to == 0 {
 		s.Error("Send event to node id is 0", zap.String("key", key), zap.Uint64("to", to), zap.String("event", event.String()))
@@ -48,13 +50,13 @@ func (s *slotTransport) Send(key string, event types.Event) {
 		MsgType: MsgTypeSlot,
 		Content: enc.Bytes(),
 	}
-	if trace.GlobalTrace != nil {
+	if currentTrace != nil {
 		if event.Type == types.SyncReq {
-			trace.GlobalTrace.Metrics.Cluster().MsgSyncOutgoingCountAdd(trace.ClusterKindSlot, 1)
-			trace.GlobalTrace.Metrics.Cluster().MsgSyncOutgoingBytesAdd(trace.ClusterKindSlot, int64(msg.Size()))
+			currentTrace.Metrics.Cluster().MsgSyncOutgoingCountAdd(trace.ClusterKindSlot, 1)
+			currentTrace.Metrics.Cluster().MsgSyncOutgoingBytesAdd(trace.ClusterKindSlot, int64(msg.Size()))
 		}
-		trace.GlobalTrace.Metrics.Cluster().MessageOutgoingCountAdd(trace.ClusterKindSlot, 1)
-		trace.GlobalTrace.Metrics.Cluster().MessageOutgoingBytesAdd(trace.ClusterKindSlot, int64(msg.Size()))
+		currentTrace.Metrics.Cluster().MessageOutgoingCountAdd(trace.ClusterKindSlot, 1)
+		currentTrace.Metrics.Cluster().MessageOutgoingBytesAdd(trace.ClusterKindSlot, int64(msg.Size()))
 	}
 
 	err = node.SendWithPriority(msg, isHighPriority(event))

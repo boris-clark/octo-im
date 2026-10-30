@@ -26,6 +26,10 @@ type configTask struct {
 // The database is the recovery journal. This queue only accelerates convergence;
 // overflow, lost notifications and restarts are repaired by bounded page scans.
 type channelConfigReconciler struct {
+	// lifecycleMu excludes worker registration after cancellation and makes
+	// start idempotent. Neither it nor the server publication lock covers joins.
+	lifecycleMu                  sync.Mutex
+	started                      bool
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	wg                           sync.WaitGroup
@@ -118,6 +122,12 @@ func (r *channelConfigReconciler) finish(key channelConfigKey, revision uint64, 
 }
 
 func (r *channelConfigReconciler) start() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started || r.ctx.Err() != nil {
+		return
+	}
+	r.started = true
 	for i := 0; i < 4; i++ {
 		r.wg.Add(1)
 		go func() {
@@ -146,7 +156,12 @@ func (r *channelConfigReconciler) start() {
 	go r.scanLoop()
 }
 
-func (r *channelConfigReconciler) stop() { r.cancel(); r.wg.Wait() }
+func (r *channelConfigReconciler) stop() {
+	r.lifecycleMu.Lock()
+	r.cancel()
+	r.lifecycleMu.Unlock()
+	r.wg.Wait()
+}
 
 func (r *channelConfigReconciler) rescan() {
 	select {
@@ -211,6 +226,10 @@ func (r *channelConfigReconciler) scanLoop() {
 	}
 }
 
+// initChannelConfigReconciler publishes only complete generations. New calls
+// this before registering listeners. Replacement also supports callbacks still
+// running on the previous generation; queue hints are repaired by durable scans.
+// Like stop, replacement must be called by the owner, never by its own worker.
 func (s *Server) initChannelConfigReconciler() {
 	r := newChannelConfigReconciler(s.cancelCtx)
 	r.process = s.reconcileChannelConfig
@@ -225,20 +244,65 @@ func (s *Server) initChannelConfigReconciler() {
 		s.Info("channel config reconciliation", zap.Int("pending", pending), zap.Duration("oldest", oldest),
 			zap.Uint64("completed", completed), zap.Uint64("retries", retries), zap.Uint64("overflow", overflow))
 	}
+	s.configReconcilerMu.Lock()
+	if s.configReconcilerClosing {
+		s.configReconcilerMu.Unlock()
+		r.stop()
+		return
+	}
+	old := s.configReconciler
+	if s.configReconcilers == nil {
+		s.configReconcilers = make(map[*channelConfigReconciler]struct{})
+	}
+	s.configReconcilers[r] = struct{}{}
 	s.configReconciler = r
+	s.configReconcilerMu.Unlock()
+	if old != nil {
+		// A worker may synchronously propose and reenter a server callback.
+		// Keep publication unlocked throughout retirement and its storage join.
+		old.stop()
+		s.configReconcilerMu.Lock()
+		delete(s.configReconcilers, old)
+		s.configReconcilerMu.Unlock()
+	}
+}
+
+func (s *Server) channelConfigReconciler() *channelConfigReconciler {
+	s.configReconcilerMu.RLock()
+	r := s.configReconciler
+	s.configReconcilerMu.RUnlock()
+	return r
+}
+
+// stopChannelConfigReconcilers closes generation admission before joining all
+// storage owners. A replacement already retiring elsewhere remains in this set.
+func (s *Server) stopChannelConfigReconcilers() {
+	s.configReconcilerMu.Lock()
+	s.configReconcilerClosing = true
+	owners := make([]*channelConfigReconciler, 0, len(s.configReconcilers))
+	for r := range s.configReconcilers {
+		owners = append(owners, r)
+		r.cancel()
+	}
+	s.configReconcilerMu.Unlock()
+	for _, r := range owners {
+		r.stop()
+	}
 }
 
 func (s *Server) hintChannelConfig(id string, typ uint8) {
-	if s.configReconciler != nil {
+	if r := s.channelConfigReconciler(); r != nil {
 		// A repeated read observes the same durable work; it is not a new write.
-		s.configReconciler.add(channelConfigKey{id, typ}, false)
+		r.add(channelConfigKey{id, typ}, false)
 	}
 }
 
 func (s *Server) onChannelConfigSaved(id string, typ uint8) {
 	// Store apply runs on replicas too. Only the slot owner distributes updates.
 	if s.cfgServer.SlotLeaderId(s.getSlotId(id)) == s.opts.ConfigOptions.NodeId {
-		s.configReconciler.add(channelConfigKey{id, typ}, true)
+		if r := s.channelConfigReconciler(); r != nil {
+			r.add(channelConfigKey{id, typ}, true)
+		}
 	}
 }
 

@@ -348,7 +348,7 @@ func TestLeader_SyncReq_UpdatesCommittedIndex(t *testing.T) {
 	n.queue.storedIndex = 10
 	n.queue.lastLogIndex = 10
 	// Simulate node 2 has synced up to index 10
-	n.replicaSync[2] = &SyncInfo{StoredIndex: 10, LastSyncIndex: 11}
+	n.replicaSync[2] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10, LastSyncIndex: 11}
 	// Now node 3 syncs
 	n.Step(types.Event{
 		Type: types.SyncReq, Term: 3, From: 3,
@@ -414,7 +414,7 @@ func TestLeader_StoreResp_Ok_StoreToAndNotifySync(t *testing.T) {
 	n.Step(evt)
 	clearEvents(n)
 	// Simulate StoreResp
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
 	assert.Equal(t, uint64(1), n.queue.storedIndex)
 	events := collectEvents(n)
 	// Should notify sync to replicas
@@ -430,7 +430,7 @@ func TestLeader_StoreResp_SingleNode_DirectCommit(t *testing.T) {
 	n.Step(evt)
 	clearEvents(n)
 	// Store response
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
 	assert.Equal(t, uint64(1), n.queue.committedIndex)
 }
 
@@ -573,9 +573,9 @@ func TestFollower_StoreResp_Ok_StoreToAndSync(t *testing.T) {
 	n.onlySync = true
 	// Append logs first
 	n.queue.append(types.Log{Term: 3, Index: 1, Data: []byte("data")})
-	n.queue.appending = true
-	n.Step(types.Event{
-		Type: types.StoreResp, Term: 3,
+	n.Ready()
+	completePendingStore(n, types.Event{
+		Type:   types.StoreResp,
 		Reason: types.ReasonOk, Index: 1,
 	})
 	assert.Equal(t, uint64(1), n.queue.storedIndex)
@@ -747,8 +747,8 @@ func TestLearner_StoreResp_Ok_StoreToAndSyncReq(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLearner(n, 3, 2)
 	n.queue.append(types.Log{Term: 3, Index: 1, Data: []byte("data")})
-	n.queue.appending = true
-	n.Step(types.Event{
+	n.Ready()
+	completePendingStore(n, types.Event{
 		Type: types.StoreResp, Reason: types.ReasonOk, Index: 1,
 	})
 	assert.Equal(t, uint64(1), n.queue.storedIndex)
@@ -802,8 +802,8 @@ func TestCommittedIndex_ThreeNodes_MajorityConfirmed(t *testing.T) {
 	n.queue.storedIndex = 10
 	n.queue.lastLogIndex = 10
 	// Both replicas have stored up to 10
-	n.replicaSync[2] = &SyncInfo{StoredIndex: 10}
-	n.replicaSync[3] = &SyncInfo{StoredIndex: 10}
+	n.replicaSync[2] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
+	n.replicaSync[3] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
 	idx := n.committedIndexForLeader()
 	// quorum=2, leader stored=10, both replicas stored=10
 	// All 3 have storedIndex >= 10, so committed should be 9 (StoredIndex-1 from the algo)
@@ -821,8 +821,8 @@ func TestCommittedIndex_ThreeNodes_MinorityConfirmed_NoAdvance(t *testing.T) {
 	n.queue.storedIndex = 10
 	n.queue.lastLogIndex = 10
 	// Only one replica has stored, not enough for quorum
-	n.replicaSync[2] = &SyncInfo{StoredIndex: 10}
-	n.replicaSync[3] = &SyncInfo{StoredIndex: 0}
+	n.replicaSync[2] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
+	n.replicaSync[3] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 0}
 	idx := n.committedIndexForLeader()
 	// getMaxLogIndexLessThanParam(0): max(10,0) both < 0? no, maxIndex=0 means condition is always true
 	// secondMaxIndex = 10, returns 9
@@ -836,10 +836,10 @@ func TestCommittedIndex_FiveNodes_MajorityConfirmed(t *testing.T) {
 	n.queue.storedIndex = 10
 	n.queue.lastLogIndex = 10
 	// All 4 replicas have synced to index 10
-	n.replicaSync[2] = &SyncInfo{StoredIndex: 10}
-	n.replicaSync[3] = &SyncInfo{StoredIndex: 10}
-	n.replicaSync[4] = &SyncInfo{StoredIndex: 10}
-	n.replicaSync[5] = &SyncInfo{StoredIndex: 10}
+	n.replicaSync[2] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
+	n.replicaSync[3] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
+	n.replicaSync[4] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
+	n.replicaSync[5] = &SyncInfo{LastLogTerm: n.cfg.Term, StoredIndex: 10}
 	// quorum=3, all replicas stored=10, leader stored=10
 	idx := n.committedIndexForLeader()
 	// The algorithm descends through all replica stored indices

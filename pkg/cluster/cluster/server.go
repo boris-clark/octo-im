@@ -20,6 +20,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
+	"github.com/WuKongIM/WuKongIM/pkg/ringlock"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -43,8 +44,13 @@ type Server struct {
 	// 槽分布式服务
 	slotServer *slot.Server
 	// channel分布式服务
-	channelServer    *channel.Server
-	configReconciler *channelConfigReconciler
+	channelServer *channel.Server
+	// configReconcilerMu publishes fully initialized generations to callbacks.
+	// Retiring generations stay tracked until joined, including during shutdown.
+	configReconcilerMu      sync.RWMutex
+	configReconciler        *channelConfigReconciler
+	configReconcilers       map[*channelConfigReconciler]struct{}
+	configReconcilerClosing bool
 	// 分布式存储
 	store *store.Store
 	// 节点管理
@@ -68,18 +74,23 @@ type Server struct {
 	stopper       *syncutil.Stopper
 
 	channelKeyLock *keylock.KeyLock // 频道锁
+	// channelInstallLock serializes local fence-to-publication decisions only.
+	channelInstallLock *ringlock.RingLock
+	slotMigrateNotify  chan struct{}
 
 	sync.Mutex
 }
 
 func New(opts *Options) *Server {
 	s := &Server{
-		opts:           opts,
-		nodeManager:    newNodeManager(opts),
-		Log:            wklog.NewWKLog("cluster"),
-		channelKeyLock: keylock.NewKeyLock(),
-		uptime:         time.Now(),
-		stopper:        syncutil.NewStopper(),
+		opts:               opts,
+		nodeManager:        newNodeManager(opts),
+		Log:                wklog.NewWKLog("cluster"),
+		channelKeyLock:     keylock.NewKeyLock(),
+		channelInstallLock: ringlock.NewRingLock(1024),
+		slotMigrateNotify:  make(chan struct{}, 1),
+		uptime:             time.Now(),
+		stopper:            syncutil.NewStopper(),
 	}
 	s.cancelCtx, s.cancelFnc = context.WithCancel(context.Background())
 	// 初始化传输层
@@ -115,16 +126,22 @@ func New(opts *Options) *Server {
 		opts.Addr,
 		wkserver.WithMessagePoolOn(false),
 		wkserver.WithOnRequest(func(conn gnet.Conn, req *proto.Request) {
-			trace.GlobalTrace.Metrics.System().IntranetIncomingAdd(int64(len(req.Body)))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().IntranetIncomingAdd(int64(len(req.Body)))
 		}),
 		wkserver.WithOnResponse(func(conn gnet.Conn, resp *proto.Response) {
-			trace.GlobalTrace.Metrics.System().IntranetOutgoingAdd(int64(len(resp.Body)))
+			currentTrace := trace.GetGlobalTrace()
+
+			currentTrace.Metrics.System().IntranetOutgoingAdd(int64(len(resp.Body)))
 		}),
 	)
 	s.netServer.OnMessage(s.onMessage)
 
 	// 节点分布式配置服务
 	s.cfgServer = clusterconfig.New(opts.ConfigOptions)
+	s.cfgServer.SetOnProposeMigrateSlot(s.proposeMigrateSlot)
+	s.cfgServer.SetProposalContext(s.cancelCtx)
 
 	//节点事件服务
 	s.eventServer = event.NewServer(s, opts.ConfigOptions, s.cfgServer)
@@ -186,24 +203,23 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	// Storage and slot owners must exist before config callbacks, and config
+	// Raft must exist before either the TCP ingress or event reader can use it.
+	err = s.slotServer.Start()
+	if err != nil {
+		return err
+	}
+	err = s.cfgServer.Start()
+	if err != nil {
+		return err
+	}
 	s.rpcServer.setRoutes()
-
 	err = s.netServer.Start()
 	if err != nil {
 		return err
 	}
 
-	err = s.slotServer.Start()
-	if err != nil {
-		return err
-	}
-
 	err = s.eventServer.Start()
-	if err != nil {
-		return err
-	}
-
-	err = s.cfgServer.Start()
 	if err != nil {
 		return err
 	}
@@ -248,7 +264,8 @@ func (s *Server) Start() error {
 	if join { // 需要加入集群
 		s.stopper.RunWorker(s.joinLoop)
 	}
-	s.configReconciler.start()
+	s.stopper.RunWorker(s.slotMigrationLoop)
+	s.channelConfigReconciler().start()
 
 	return nil
 }
@@ -267,12 +284,17 @@ func (s *Server) Stop() error {
 // lifecycles and closes the shared DB once every owner has quiesced.
 func (s *Server) StopWithContext(ctx context.Context) error {
 	s.stopBegin.Do(func() {
+		// Fence proposal/RPC waits before joining their workers; storage remains
+		// owned until the unchanged shutdown sequence collects every owner.
+		if s.cancelFnc != nil {
+			s.cancelFnc()
+		}
 		// The reconciler can be inside a synchronous page read, and the join
 		// worker inside an RPC with its own timeout. Join them in one tracked
 		// lifecycle so ctx bounds the wait while storage stays owned.
 		joined := make(chan struct{})
 		go func() {
-			s.configReconciler.stop()
+			s.stopChannelConfigReconcilers()
 			s.stopper.Stop()
 			s.eventServer.Stop()
 			close(joined)
@@ -398,7 +420,15 @@ func (s *Server) GetStore() *store.Store {
 
 // 配置改变
 func (s *Server) OnConfigChange(cfg *types.Config) {
-	s.configReconciler.rescan()
+	if r := s.channelConfigReconciler(); r != nil {
+		r.rescan()
+	}
+	for _, st := range cfg.Slots {
+		if st != nil && (st.MigrateFrom != 0 || st.MigrateTo != 0 || len(st.Learners) > 0) {
+			s.notifySlotMigration()
+			break
+		}
+	}
 
 	nodeMap := make(map[uint64]string)
 	for _, node := range cfg.Nodes {
@@ -476,6 +506,12 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 		s.Error("slot not found", zap.Uint32("slotId", slotId))
 		return errors.New("slot not found")
 	}
+	if slot.InstalledTerm != 0 {
+		s.notifySlotMigration()
+		ctx, cancel := context.WithTimeout(s.cancelCtx, 3*time.Second)
+		defer cancel()
+		return s.tryCompleteSlotMigration(ctx, slotId)
+	}
 	cloneSlot := slot.Clone()
 	// 更新slot的配置
 	s.updateSlotByConfig(cloneSlot, cfg)
@@ -494,7 +530,19 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg rafttype.Config) error {
 	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
 	defer cancel()
-	channelCfg, err := s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
+	var channelCfg wkdb.ChannelClusterConfig
+	var err error
+	for {
+		channelCfg, err = s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
+		if !errors.Is(err, ErrConversationReadRetry) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
 		return err

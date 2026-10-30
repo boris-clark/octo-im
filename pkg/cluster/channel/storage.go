@@ -3,6 +3,8 @@ package channel
 import (
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -90,22 +92,34 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 	if err != nil {
 		return types.RaftState{}, err
 	}
+	barrier, err := s.db.LastChannelNoop(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return types.RaftState{}, err
+	}
+	lastIndex, lastTerm := uint64(lastMsg.MessageSeq), uint32(lastMsg.Term)
+	if barrier.Index > lastIndex {
+		lastIndex, lastTerm = barrier.Index, barrier.Term
+	}
 
 	applied, err := s.db.GetChannelAppliedIndex(channelId, channelType)
 	if err != nil {
 		return types.RaftState{}, err
 	}
-	if applied > uint64(lastMsg.MessageSeq) {
+	if applied > lastIndex {
 		return types.RaftState{}, fmt.Errorf("channel applied index exceeds log tail")
 	}
 	state, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
 	if err != nil {
 		return types.RaftState{}, err
 	}
+	if state.CommittedFloor > lastIndex {
+		return types.RaftState{}, fmt.Errorf("channel committed floor exceeds stored tail")
+	}
 	return types.RaftState{
 		HardState:    state,
-		LastLogIndex: uint64(lastMsg.MessageSeq),
-		LastTerm:     uint32(lastMsg.Term),
+		Diverged:     state.Quarantined,
+		LastLogIndex: lastIndex,
+		LastTerm:     lastTerm,
 		AppliedIndex: applied,
 	}, nil
 }
@@ -114,8 +128,14 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 
 	channelId, channelType := wkutil.ChannelFromlKey(key)
 
-	messages := make([]wkdb.Message, 0, len(logs))
-	for _, log := range logs {
+	messages := make([]wkdb.Message, len(logs))
+	for i, log := range logs {
+		if log.Index == 0 || log.Index > math.MaxUint32 || log.Term == 0 {
+			return fmt.Errorf("channel log index or term out of range")
+		}
+		if types.IsNoop(log) {
+			continue
+		}
 		var msg wkdb.Message
 		err := msg.Unmarshal(log.Data)
 		if err != nil {
@@ -124,19 +144,55 @@ func (s *storage) AppendLogs(key string, logs []types.Log, termStartIndexInfo *t
 		}
 		msg.MessageSeq = uint32(log.Index)
 		msg.Term = uint64(log.Term)
-		messages = append(messages, msg)
-	}
-	err := s.db.AppendMessages(channelId, channelType, messages)
-	if err != nil {
-		return err
+		messages[i] = msg
 	}
 	if termStartIndexInfo != nil {
-		err = s.db.SetLeaderTermStartIndex(key, termStartIndexInfo.Term, termStartIndexInfo.Index)
-		if err != nil {
+		matched := false
+		for _, log := range logs {
+			if log.Index == termStartIndexInfo.Index && log.Term == termStartIndexInfo.Term {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("term boundary is outside channel append")
+		}
+	}
+	// Preserve a durable prefix across partial failures: a later message must
+	// never become the recovered tail before its preceding barrier is stored.
+	start := 0
+	for i, log := range logs {
+		if types.IsNoop(log) {
+			if start < i {
+				if err := s.appendMessages(channelId, channelType, messages[start:i], termStartIndexInfo); err != nil {
+					return err
+				}
+			}
+			if err := s.db.AppendChannelNoop(key, log); err != nil {
+				return err
+			}
+			start = i + 1
+		}
+	}
+	if start < len(logs) {
+		if err := s.appendMessages(channelId, channelType, messages[start:], termStartIndexInfo); err != nil {
 			return err
 		}
 	}
+
 	return nil
+}
+
+// Each message segment publishes its term boundary in the same synced batch.
+func (s *storage) appendMessages(id string, typ uint8, messages []wkdb.Message, term *types.TermStartIndexInfo) error {
+	if term != nil {
+		for _, msg := range messages {
+			if uint64(msg.MessageSeq) == term.Index && uint32(msg.Term) == term.Term {
+				return s.db.AppendMessagesWithTerm(id, typ, messages, term)
+			}
+		}
+	}
+	return s.db.AppendMessages(id, typ, messages)
 }
 
 func (s *storage) GetTermStartIndex(key string, term uint32) (uint64, error) {
@@ -173,9 +229,6 @@ func (s *storage) GetLogs(key string, startLogIndex uint64, endLogIndex uint64, 
 		return nil, err
 	}
 
-	if len(messages) == 0 {
-		return nil, nil
-	}
 	logs := make([]types.Log, len(messages))
 	for i := range messages {
 		msg := &messages[i]
@@ -202,6 +255,27 @@ func (s *storage) GetLogs(key string, startLogIndex uint64, endLogIndex uint64, 
 			Term:  uint32(msg.Term),
 			Data:  data,
 		}
+	}
+	barriers, err := s.db.ChannelNoops(key, startLogIndex, endLogIndex)
+	if err != nil {
+		return nil, err
+	}
+	if len(barriers) == 0 {
+		return logs, nil
+	}
+	logs = append(logs, barriers...)
+	sort.Slice(logs, func(i, j int) bool { return logs[i].Index < logs[j].Index })
+	// Message size limits apply before merging. Return only a contiguous prefix
+	// and preserve the original at-least-one-entry behavior of bounded reads.
+	var size uint64
+	for i, log := range logs {
+		if i > 0 && limitSize > 0 && size >= limitSize {
+			return logs[:i], nil
+		}
+		if log.Index != max(uint64(1), startLogIndex)+uint64(i) {
+			return nil, fmt.Errorf("noncontiguous channel log at %d", log.Index)
+		}
+		size += uint64(log.LogSize())
 	}
 	return logs, nil
 }
@@ -255,7 +329,8 @@ func (s *storage) LastIndex(key string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return uint64(lastMsgSeq), nil
+	barrier, err := s.db.LastChannelNoop(key)
+	return max(uint64(lastMsgSeq), barrier.Index), err
 }
 
 // DeleteLeaderTermStartIndexGreaterThanTerm 删除大于term的领导任期和开始索引
@@ -270,10 +345,23 @@ func (s *storage) LastIndexAndAppendTime(shardNo string) (uint64, uint64, error)
 	if err != nil {
 		return 0, 0, err
 	}
-	return uint64(lastMsgSeq), appendTime, nil
+	barrier, err := s.db.LastChannelNoop(shardNo)
+	return max(uint64(lastMsgSeq), barrier.Index), appendTime, err
 }
 
 func (s *storage) getLastMessage(channelId string, channelType uint8) (wkdb.Message, error) {
 
 	return s.db.GetLastMsg(channelId, channelType)
+}
+
+func (*storage) AtomicLogTruncation() {}
+
+// MarkDiverged persists the existing replica's quarantine through the same hard-state domain.
+func (s *storage) MarkDiverged(key string, cause error) error {
+	hard, err := s.db.RaftHardState(key)
+	if err != nil {
+		return err
+	}
+	hard.Quarantined = true
+	return s.db.SaveRaftHardState(key, hard)
 }

@@ -3,18 +3,32 @@ package cluster
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 // saveChannelConfig keeps the existing slot log format, but fences the decision
 // at admission. cfg.ConfVersion is the version being replaced (zero for create).
 // All production metadata writers use this method on the current slot leader.
 func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) (uint64, error) {
+	key := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return 0, err
+	}
+	defer s.channelInstallLock.Unlock(key)
+	return s.saveChannelConfigLocked(ctx, cfg)
+}
+
+// The local guard spans fence persistence and slot apply, so another callback
+// cannot mistake an in-flight fence for a crashed installation and supersede it.
+// Distributed ownership still comes from the slot read barrier and applied CAS.
+func (s *Server) saveChannelConfigLocked(ctx context.Context, cfg wkdb.ChannelClusterConfig) (uint64, error) {
 	slotID := s.getSlotId(cfg.ChannelId)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -32,6 +46,36 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			return 0, ErrConversationReadRetry
 		}
 		if before.Ready {
+			current, err := s.fencedChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+				return 0, err
+			}
+			if current.ConfVersion != cfg.ConfVersion {
+				return 0, raft.ErrConfigVersionStale
+			}
+			if !wkdb.IsEmptyChannelClusterConfig(current) && current.InstalledTerm != 0 && !sameChannelMembership(current, cfg) {
+				if err := s.certifyChannelMembership(ctx, current, &cfg); err != nil {
+					return 0, err
+				}
+			}
+			if cfg.Expected == nil && !wkdb.IsEmptyChannelClusterConfig(current) &&
+				(cfg.Term != current.Term || cfg.LeaderId != current.LeaderId) {
+				// Term/leader callbacks are proposals to the authority, not
+				// certificates. Fence the applied voters before publishing them.
+				if !slices.Equal(cfg.Replicas, current.Replicas) || !slices.Equal(cfg.Learners, current.Learners) ||
+					cfg.MigrateFrom != current.MigrateFrom || cfg.MigrateTo != current.MigrateTo || cfg.Term <= current.Term {
+					return 0, raft.ErrElectionNotInstalled
+				}
+				certified := current.Clone()
+				if _, err := s.fenceChannelConfig(ctx, &certified, cfg.Term); err != nil {
+					return 0, err
+				}
+				if certified.LeaderId != cfg.LeaderId {
+					return 0, ErrConversationReadRetry
+				}
+				cfg.Expected = &current
+				cfg.InstalledTerm, cfg.BoundaryTerm = certified.InstalledTerm, certified.BoundaryTerm
+			}
 			validate := func() error {
 				if s.cfgServer.SlotLeaderId(slotID) != s.opts.ConfigOptions.NodeId {
 					return ErrConversationReadRetry
@@ -40,7 +84,7 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 				if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
 					return err
 				}
-				if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term {
+				if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term || cfg.Expected != nil && !current.Equal(*cfg.Expected) {
 					return raft.ErrConfigVersionStale
 				}
 				return nil
@@ -65,6 +109,18 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			}
 			version, err := s.slotServer.ProposeAfterRead(ctx, slotID, before, data, validate)
 			if !errors.Is(err, raftgroup.ErrReadStateChanged) {
+				if cfg.Expected != nil || err == nil {
+					current, readErr := s.fencedChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+					desired := cfg.Clone()
+					desired.Id = current.Id
+					desired.ConfVersion = current.ConfVersion
+					if readErr == nil && current.Equal(desired) {
+						return current.ConfVersion, nil
+					}
+					if err == nil {
+						err = raft.ErrConfigVersionStale
+					}
+				}
 				return version, err
 			}
 		}

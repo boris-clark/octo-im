@@ -7,6 +7,24 @@ import (
 )
 
 func (n *Node) Step(e types.Event) error {
+	// External-controller replicas accept commitment claims only from the installed local leader.
+	if n.opts.SaveHardState != nil && !n.opts.ElectionOn && (e.Type == types.Ping || e.Type == types.SyncResp) && (e.Term != n.cfg.Term || n.cfg.Leader == 0 || e.From != n.cfg.Leader) {
+		return nil
+	}
+	if e.Type == types.StoreResp {
+		if !n.consumeStoreResponse(e) {
+			return nil
+		}
+	}
+	// An accepted append owns its original range through completion. A peer
+	// retries overlapping sync data once that append has a terminal disposition.
+	if e.Type == types.SyncResp && len(e.Logs) > 0 && n.pendingStore != nil {
+		req := n.pendingStore.Request()
+		if e.Logs[0].Index <= req.Logs[len(req.Logs)-1].Index {
+			return nil
+		}
+	}
+
 	// Storage refused a truncation or an append that would have left the
 	// applied state inconsistent with the log. Quarantine before anything
 	// else can act on the in-memory log.
@@ -19,6 +37,9 @@ func (n *Node) Step(e types.Event) error {
 			n.truncating = false
 		}
 		n.quarantine(state, "storage refused "+e.Type.String())
+		return nil
+	}
+	if n.rejectUninstalledEvent(e) {
 		return nil
 	}
 	if n.Diverged() {
@@ -519,13 +540,17 @@ func (n *Node) updateSyncInfo(e types.Event) {
 	syncInfo.SyncTick = 0
 	syncInfo.LastSyncIndex = e.Index
 	syncInfo.StoredIndex = e.StoredIndex
+	if n.fenceEnabled() && (!n.isVoter(e.From) || e.LastLogTerm != n.cfg.Term) {
+		syncInfo.StoredIndex = 0
+	}
+	syncInfo.LastLogTerm = e.LastLogTerm
 }
 
 // 更新领导的提交索引
 func (n *Node) updateLeaderCommittedIndex() bool {
 	newCommitted := n.committedIndexForLeader() // 通过副本同步信息计算领导已提交下标
 	updated := false
-	if newCommitted > n.queue.committedIndex {
+	if newCommitted > n.queue.committedIndex && n.persistCommit(newCommitted) {
 		n.queue.committedIndex = newCommitted
 		updated = true
 		n.Debug("update leader committed index", zap.Uint64("lastIndex", n.queue.lastLogIndex), zap.Uint32("term", n.cfg.Term), zap.Uint64("committedIndex", n.queue.committedIndex))
@@ -537,8 +562,17 @@ func (n *Node) updateLeaderCommittedIndex() bool {
 func (n *Node) committedIndexForLeader() uint64 {
 
 	committed := n.queue.committedIndex
+	// A legacy applied-only tail needs a fresh store beyond that progress.
+	// Sync can arrive before config resume admits its recovery entry; do not
+	// let that early acknowledgement skip the subsequent real apply gate.
+	if n.opts.SaveHardState != nil && n.queue.appliedIndex > committed && n.queue.storedIndex <= n.queue.appliedIndex {
+		return committed
+	}
 	quorum := n.quorum() // r.replicas 不包含本节点
 	if quorum <= 1 {     // 如果少于或等于一个节点，那么直接返回最后一条日志下标
+		if n.opts.SaveHardState != nil && n.LastLogTerm() != n.cfg.Term {
+			return committed
+		}
 		return n.queue.storedIndex
 	}
 
@@ -546,7 +580,7 @@ func (n *Node) committedIndexForLeader() uint64 {
 	getMaxLogIndexLessThanParam := func(maxIndex uint64) uint64 {
 		secondMaxIndex := uint64(0)
 		for id, syncInfo := range n.replicaSync {
-			if id == n.opts.NodeId || !n.isVoter(id) {
+			if id == n.opts.NodeId || !n.isVoter(id) || syncInfo.LastLogTerm != n.cfg.Term {
 				continue
 			}
 			if syncInfo.StoredIndex < maxIndex || maxIndex == 0 {
@@ -576,7 +610,7 @@ func (n *Node) committedIndexForLeader() uint64 {
 			continue
 		}
 		for id, syncInfo := range n.replicaSync {
-			if id == n.opts.NodeId || !n.isVoter(id) {
+			if id == n.opts.NodeId || !n.isVoter(id) || syncInfo.LastLogTerm != n.cfg.Term {
 				continue
 			}
 			if syncInfo.StoredIndex >= maxLogIndex+1 {
@@ -597,11 +631,11 @@ func (n *Node) committedIndexForLeader() uint64 {
 
 // 更新跟随者的提交索引
 func (n *Node) updateFollowCommittedIndex(leaderCommittedIndex uint64) {
-	if leaderCommittedIndex == 0 || leaderCommittedIndex <= n.queue.committedIndex {
+	if n.fenceEnabled() && n.LastLogTerm() != n.cfg.Term || leaderCommittedIndex == 0 || leaderCommittedIndex <= n.queue.committedIndex {
 		return
 	}
 	newCommittedIndex := n.committedIndexForFollow(leaderCommittedIndex)
-	if newCommittedIndex > n.queue.committedIndex {
+	if newCommittedIndex > n.queue.committedIndex && n.persistCommit(newCommittedIndex) {
 		n.queue.committedIndex = newCommittedIndex
 		n.Debug("update follow committed index", zap.Uint64("nodeId", n.opts.NodeId), zap.Uint32("term", n.cfg.Term), zap.Uint64("committedIndex", n.queue.committedIndex))
 	}
@@ -719,6 +753,27 @@ func (n *Node) roleSwitchIfNeed(e types.Event) {
 // longer holds. Such a truncation therefore waits for the in-flight store.
 // truncating stays set meanwhile, so no sync or new store starts.
 func (n *Node) requestTruncate(index uint64) {
+	// A term-boundary reconciliation may name the tail already retained.
+	// No log is removed in that case. Continue the authenticated sync handshake
+	// without crossing a committed or legacy boundary or mutating durable state.
+	if index >= n.queue.lastLogIndex && index >= max(n.queue.committedIndex, n.queue.appliedIndex) {
+		n.sendSyncReq()
+		return
+	}
+	if index < max(n.queue.committedIndex, n.queue.appliedIndex) || n.safetyState.BoundaryTerm != 0 {
+		n.safetyState.Quarantined = true
+		state := divergeQuarantined
+		if n.opts.SaveHardState != nil {
+			hard := n.hardState()
+			if err := n.opts.SaveHardState(hard); err != nil {
+				state = divergeFailStopped
+			} else {
+				n.persistedHardState = hard
+			}
+		}
+		n.quarantine(state, "refused truncation of committed or legacy history")
+		return
+	}
 	n.truncating = true
 	if n.queue.appending {
 		n.deferredTruncate = index

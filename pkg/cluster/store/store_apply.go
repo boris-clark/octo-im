@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -17,6 +18,9 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 		cmds := make([]*CMD, 0, len(logs))
 		logIndexs := make([]uint64, 0, len(logs))
 		for _, log := range logs {
+			if len(log.Data) == 0 || types.IsNoop(log) || bytes.Equal(log.Data, types.NoopData()) {
+				continue
+			}
 			cmd := &CMD{}
 			err := cmd.Unmarshal(log.Data)
 			if err != nil {
@@ -33,6 +37,9 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 		}
 	} else {
 		for _, log := range logs {
+			if len(log.Data) == 0 || types.IsNoop(log) || bytes.Equal(log.Data, types.NoopData()) {
+				continue
+			}
 			err := s.applyLog(slotId, log)
 			if err != nil {
 				cmd := &CMD{}

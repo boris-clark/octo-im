@@ -25,6 +25,9 @@ func (n *Node) switchRemoteConfig(cfg types.Config) error {
 	default:
 		return errors.New("local node is not a member of config response")
 	}
+	if n.fenceEnabled() {
+		return ErrElectionNotInstalled
+	}
 	cfg.Term = n.cfg.Term
 	return n.switchConfig(cfg)
 }
@@ -32,11 +35,15 @@ func (n *Node) switchRemoteConfig(cfg types.Config) error {
 func (n *Node) switchConfig(newCfg types.Config) error {
 
 	oldCfg := n.cfg
+
 	if n.cfg.Version > newCfg.Version {
 		n.Error("config version is lower than current version", zap.Uint64("newVersion", newCfg.Version), zap.Uint64("currentVersion", oldCfg.Version))
 		return ErrConfigVersionStale
 	}
 
+	if err := n.checkInstalledConfig(newCfg); err != nil {
+		return err
+	}
 	if newCfg.Term != 0 && newCfg.Term < oldCfg.Term {
 		n.Error("term is lower than current term", zap.Uint32("newTerm", newCfg.Term), zap.Uint32("currentTerm", oldCfg.Term))
 		newCfg.Term = oldCfg.Term

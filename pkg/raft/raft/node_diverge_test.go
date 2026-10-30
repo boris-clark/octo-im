@@ -51,7 +51,7 @@ func TestRefusedTruncationQuarantinesReplica(t *testing.T) {
 				n.onlySync = true
 				n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonOk, Logs: termLogs(2, 1, 10), CommittedIndex: 0})
 				clearEvents(n)
-				n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 10})
+				completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 10})
 				clearEvents(n)
 				n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonTruncate, Index: 4})
 				trunc, ok := findEvent(collectEvents(n), types.TruncateReq)
@@ -76,7 +76,7 @@ func TestRefusedAppendQuarantinesReplica(t *testing.T) {
 	n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonOk, Logs: termLogs(2, 1, 5)})
 	store, ok := findEvent(collectEvents(n), types.StoreReq)
 	require.True(t, ok)
-	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: store.Logs[len(store.Logs)-1].Index}))
+	completePendingStore(n, localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: store.Logs[len(store.Logs)-1].Index}))
 	require.False(t, n.queue.appending)
 	require.EqualValues(t, 0, n.queue.storedIndex, "nothing marked stored")
 	requireFenced(t, n)
@@ -107,7 +107,7 @@ func TestDivergedLeaderStepsDown(t *testing.T) {
 	_, err := n.Admit([]types.Log{{Data: []byte("a")}})
 	require.NoError(t, err)
 	clearEvents(n)
-	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: 1}))
+	completePendingStore(n, localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDiverged, Index: 1}))
 	fence, ok := findEvent(n.events, types.ProposalFence)
 	require.True(t, ok, "leader waiters are fenced")
 	require.EqualValues(t, 4, fence.Term)
@@ -189,7 +189,7 @@ func migratingLeader(t *testing.T, disabled bool, toLearner bool) *Node {
 		require.NoError(t, err)
 	}
 	clearEvents(n)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 5})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 5})
 	clearEvents(n)
 	return n
 }
@@ -233,7 +233,7 @@ func TestLearnerToFollowerStillAllowedWithRoleSwitchDisabled(t *testing.T) {
 	require.NoError(t, n.Step(types.Event{Type: types.ConfChange, Config: types.Config{Replicas: []uint64{1, 2}, Learners: []uint64{3}, Leader: 1, Role: types.RoleLeader, Term: 2, Version: 1, MigrateFrom: 2, MigrateTo: 3}}))
 	_, err := n.Admit([]types.Log{{Data: []byte("x")}})
 	require.NoError(t, err)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 1})
 	clearEvents(n)
 	n.Step(types.Event{Type: types.SyncReq, Term: 2, From: 3, Index: 2, StoredIndex: 2})
 	_, ok := findEvent(collectEvents(n), types.LearnerToFollowerReq)
@@ -323,8 +323,11 @@ func TestOnQuarantineCallback(t *testing.T) {
 	opts := NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2, 3}), WithOnQuarantine(func(failStop bool, _ string) { calls = append(calls, failStop) }))
 	n := NewNode(0, types.RaftState{}, opts)
 	n.BecomeFollower(2, 2)
+	n.onlySync = true
+	n.Step(types.Event{Type: types.SyncResp, From: 2, Term: 2, Reason: types.ReasonOk, Logs: termLogs(2, 1, 1)})
+	n.Ready()
 	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
 	n.Step(localRefusal(types.Event{Type: types.TruncateResp, Reason: types.ReasonDiverged}))
-	n.Step(localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDivergedFailStop}))
+	completePendingStore(n, localRefusal(types.Event{Type: types.StoreResp, Reason: types.ReasonDivergedFailStop}))
 	require.Equal(t, []bool{false, true}, calls)
 }

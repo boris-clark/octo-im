@@ -7,6 +7,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
@@ -23,12 +24,14 @@ import (
 var _ DB = (*wukongDB)(nil)
 
 type wukongDB struct {
-	dbs      []*pebble.DB
-	wkdbs    []*BatchDB
-	shardNum uint32 // 分区数量，这个一但设置就不能修改
-	opts     *Options
-	sync     *pebble.WriteOptions
-	endian   binary.ByteOrder
+	logMetadataMu sync.Mutex // Serializes canonical metadata adoption and log/term mutations.
+	raftLocks     [128]sync.Mutex
+	dbs           []*pebble.DB
+	wkdbs         []*BatchDB
+	shardNum      uint32 // 分区数量，这个一但设置就不能修改
+	opts          *Options
+	sync          *pebble.WriteOptions
+	endian        binary.ByteOrder
 	wklog.Log
 	prmaryKeyGen *snowflake.Node // 消息ID生成器
 	noSync       *pebble.WriteOptions
@@ -37,6 +40,8 @@ type wukongDB struct {
 	cancelFunc   context.CancelFunc
 
 	metrics trace.IDBMetrics
+	// metricsWG joins the collector before storage and trace ownership return.
+	metricsWG sync.WaitGroup
 
 	channelSeqCache     *channelSeqCache
 	conversationCache   *ConversationCache
@@ -52,14 +57,16 @@ type wukongDB struct {
 }
 
 func NewWukongDB(opts *Options) DB {
+	currentTrace := trace.GetGlobalTrace()
+
 	prmaryKeyGen, err := snowflake.NewNode(int64(opts.NodeId))
 	if err != nil {
 		panic(err)
 	}
 
 	var metrics trace.IDBMetrics
-	if trace.GlobalTrace != nil {
-		metrics = trace.GlobalTrace.Metrics.DB()
+	if currentTrace != nil {
+		metrics = currentTrace.Metrics.DB()
 	} else {
 		metrics = trace.NewDBMetrics()
 	}
@@ -159,7 +166,8 @@ func (wk *wukongDB) Open() error {
 		wk.wkdbs = append(wk.wkdbs, wkdb)
 	}
 
-	go wk.collectMetricsLoop()
+	wk.metricsWG.Add(1)
+	go func() { defer wk.metricsWG.Done(); wk.collectMetricsLoop() }()
 
 	// 启动缓存管理器
 	wk.cacheManager.Start()
@@ -169,6 +177,7 @@ func (wk *wukongDB) Open() error {
 
 func (wk *wukongDB) Close() error {
 	wk.cancelFunc()
+	wk.metricsWG.Wait()
 
 	// 停止缓存管理器
 	if wk.cacheManager != nil {
@@ -261,70 +270,70 @@ func (wk *wukongDB) collectMetrics() {
 		ms := wk.dbs[i].Metrics()
 
 		// ========== compact 压缩相关 ==========
-		trace.GlobalTrace.Metrics.DB().CompactTotalCountSet(i, ms.Compact.Count)
-		trace.GlobalTrace.Metrics.DB().CompactDefaultCountSet(i, ms.Compact.DefaultCount)
-		trace.GlobalTrace.Metrics.DB().CompactDeleteOnlyCountSet(i, ms.Compact.DeleteOnlyCount)
-		trace.GlobalTrace.Metrics.DB().CompactElisionOnlyCountSet(i, ms.Compact.ElisionOnlyCount)
-		trace.GlobalTrace.Metrics.DB().CompactEstimatedDebtSet(i, int64(ms.Compact.EstimatedDebt))
-		trace.GlobalTrace.Metrics.DB().CompactInProgressBytesSet(i, ms.Compact.InProgressBytes)
-		trace.GlobalTrace.Metrics.DB().CompactMarkedFilesSet(i, int64(ms.Compact.MarkedFiles))
-		trace.GlobalTrace.Metrics.DB().CompactMoveCountSet(i, ms.Compact.MoveCount)
-		trace.GlobalTrace.Metrics.DB().CompactMultiLevelCount(i, ms.Compact.MultiLevelCount)
-		trace.GlobalTrace.Metrics.DB().CompactNumInProgressSet(i, ms.Compact.NumInProgress)
-		trace.GlobalTrace.Metrics.DB().CompactReadCountSet(i, ms.Compact.ReadCount)
-		trace.GlobalTrace.Metrics.DB().CompactRewriteCountSet(i, ms.Compact.RewriteCount)
+		wk.metrics.CompactTotalCountSet(i, ms.Compact.Count)
+		wk.metrics.CompactDefaultCountSet(i, ms.Compact.DefaultCount)
+		wk.metrics.CompactDeleteOnlyCountSet(i, ms.Compact.DeleteOnlyCount)
+		wk.metrics.CompactElisionOnlyCountSet(i, ms.Compact.ElisionOnlyCount)
+		wk.metrics.CompactEstimatedDebtSet(i, int64(ms.Compact.EstimatedDebt))
+		wk.metrics.CompactInProgressBytesSet(i, ms.Compact.InProgressBytes)
+		wk.metrics.CompactMarkedFilesSet(i, int64(ms.Compact.MarkedFiles))
+		wk.metrics.CompactMoveCountSet(i, ms.Compact.MoveCount)
+		wk.metrics.CompactMultiLevelCount(i, ms.Compact.MultiLevelCount)
+		wk.metrics.CompactNumInProgressSet(i, ms.Compact.NumInProgress)
+		wk.metrics.CompactReadCountSet(i, ms.Compact.ReadCount)
+		wk.metrics.CompactRewriteCountSet(i, ms.Compact.RewriteCount)
 
 		// ========== flush 相关 ==========
-		trace.GlobalTrace.Metrics.DB().FlushCountAdd(i, int64(ms.Flush.Count))
-		trace.GlobalTrace.Metrics.DB().FlushBytesAdd(i, ms.Flush.WriteThroughput.Bytes)
-		trace.GlobalTrace.Metrics.DB().FlushNumInProgressAdd(i, ms.Flush.NumInProgress)
-		trace.GlobalTrace.Metrics.DB().FlushAsIngestCountAdd(i, int64(ms.Flush.AsIngestCount))
-		trace.GlobalTrace.Metrics.DB().FlushAsIngestTableCountAdd(i, int64(ms.Flush.AsIngestTableCount))
-		trace.GlobalTrace.Metrics.DB().FlushAsIngestBytesAdd(i, int64(ms.Flush.AsIngestBytes))
+		wk.metrics.FlushCountAdd(i, int64(ms.Flush.Count))
+		wk.metrics.FlushBytesAdd(i, ms.Flush.WriteThroughput.Bytes)
+		wk.metrics.FlushNumInProgressAdd(i, ms.Flush.NumInProgress)
+		wk.metrics.FlushAsIngestCountAdd(i, int64(ms.Flush.AsIngestCount))
+		wk.metrics.FlushAsIngestTableCountAdd(i, int64(ms.Flush.AsIngestTableCount))
+		wk.metrics.FlushAsIngestBytesAdd(i, int64(ms.Flush.AsIngestBytes))
 
 		// ========== memtable 内存表相关 ==========
-		trace.GlobalTrace.Metrics.DB().MemTableCountSet(i, int64(ms.MemTable.Count))
-		trace.GlobalTrace.Metrics.DB().MemTableSizeSet(i, int64(ms.MemTable.Size))
-		trace.GlobalTrace.Metrics.DB().MemTableZombieSizeSet(i, int64(ms.MemTable.ZombieSize))
-		trace.GlobalTrace.Metrics.DB().MemTableZombieCountSet(i, ms.MemTable.ZombieCount)
+		wk.metrics.MemTableCountSet(i, int64(ms.MemTable.Count))
+		wk.metrics.MemTableSizeSet(i, int64(ms.MemTable.Size))
+		wk.metrics.MemTableZombieSizeSet(i, int64(ms.MemTable.ZombieSize))
+		wk.metrics.MemTableZombieCountSet(i, ms.MemTable.ZombieCount)
 
 		// ========== Snapshots 镜像相关 ==========
-		trace.GlobalTrace.Metrics.DB().SnapshotsCountSet(i, int64(ms.Snapshots.Count))
+		wk.metrics.SnapshotsCountSet(i, int64(ms.Snapshots.Count))
 
 		// ========== TableCache 相关 ==========
-		trace.GlobalTrace.Metrics.DB().TableCacheSizeSet(i, ms.TableCache.Size)
-		trace.GlobalTrace.Metrics.DB().TableCacheCountSet(i, ms.TableCache.Count)
-		trace.GlobalTrace.Metrics.DB().TableItersCountSet(i, ms.TableIters)
+		wk.metrics.TableCacheSizeSet(i, ms.TableCache.Size)
+		wk.metrics.TableCacheCountSet(i, ms.TableCache.Count)
+		wk.metrics.TableItersCountSet(i, ms.TableIters)
 
 		// ========== WAL 相关 ==========
-		trace.GlobalTrace.Metrics.DB().WALFilesCountSet(i, ms.WAL.Files)
-		trace.GlobalTrace.Metrics.DB().WALSizeSet(i, int64(ms.WAL.Size))
-		trace.GlobalTrace.Metrics.DB().WALPhysicalSizeSet(i, int64(ms.WAL.PhysicalSize))
-		trace.GlobalTrace.Metrics.DB().WALObsoleteFilesCountSet(i, ms.WAL.ObsoleteFiles)
-		trace.GlobalTrace.Metrics.DB().WALObsoletePhysicalSizeSet(i, int64(ms.WAL.ObsoletePhysicalSize))
-		trace.GlobalTrace.Metrics.DB().WALBytesInSet(i, int64(ms.WAL.BytesIn))
-		trace.GlobalTrace.Metrics.DB().WALBytesWrittenSet(i, int64(ms.WAL.BytesWritten))
+		wk.metrics.WALFilesCountSet(i, ms.WAL.Files)
+		wk.metrics.WALSizeSet(i, int64(ms.WAL.Size))
+		wk.metrics.WALPhysicalSizeSet(i, int64(ms.WAL.PhysicalSize))
+		wk.metrics.WALObsoleteFilesCountSet(i, ms.WAL.ObsoleteFiles)
+		wk.metrics.WALObsoletePhysicalSizeSet(i, int64(ms.WAL.ObsoletePhysicalSize))
+		wk.metrics.WALBytesInSet(i, int64(ms.WAL.BytesIn))
+		wk.metrics.WALBytesWrittenSet(i, int64(ms.WAL.BytesWritten))
 
 		// ========== Write 相关 ==========
-		trace.GlobalTrace.Metrics.DB().LogWriterBytesSet(i, ms.LogWriter.WriteThroughput.Bytes)
+		wk.metrics.LogWriterBytesSet(i, ms.LogWriter.WriteThroughput.Bytes)
 
-		trace.GlobalTrace.Metrics.DB().DiskSpaceUsageSet(i, int64(ms.DiskSpaceUsage()))
+		wk.metrics.DiskSpaceUsageSet(i, int64(ms.DiskSpaceUsage()))
 
 		// ========== level 相关 ==========
 
-		trace.GlobalTrace.Metrics.DB().LevelNumFilesSet(i, ms.Total().NumFiles)
-		trace.GlobalTrace.Metrics.DB().LevelFileSizeSet(i, int64(ms.Total().Size))
-		trace.GlobalTrace.Metrics.DB().LevelCompactScoreSet(i, int64(ms.Total().Score))
-		trace.GlobalTrace.Metrics.DB().LevelBytesInSet(i, int64(ms.Total().BytesIn))
-		trace.GlobalTrace.Metrics.DB().LevelBytesIngestedSet(i, int64(ms.Total().BytesIngested))
-		trace.GlobalTrace.Metrics.DB().LevelBytesMovedSet(i, int64(ms.Total().BytesMoved))
-		trace.GlobalTrace.Metrics.DB().LevelBytesReadSet(i, int64(ms.Total().BytesRead))
-		trace.GlobalTrace.Metrics.DB().LevelBytesCompactedSet(i, int64(ms.Total().BytesCompacted))
-		trace.GlobalTrace.Metrics.DB().LevelBytesFlushedSet(i, int64(ms.Total().BytesFlushed))
-		trace.GlobalTrace.Metrics.DB().LevelTablesCompactedSet(i, int64(ms.Total().TablesCompacted))
-		trace.GlobalTrace.Metrics.DB().LevelTablesFlushedSet(i, int64(ms.Total().TablesFlushed))
-		trace.GlobalTrace.Metrics.DB().LevelTablesIngestedSet(i, int64(ms.Total().TablesIngested))
-		trace.GlobalTrace.Metrics.DB().LevelTablesMovedSet(i, int64(ms.Total().TablesMoved))
+		wk.metrics.LevelNumFilesSet(i, ms.Total().NumFiles)
+		wk.metrics.LevelFileSizeSet(i, int64(ms.Total().Size))
+		wk.metrics.LevelCompactScoreSet(i, int64(ms.Total().Score))
+		wk.metrics.LevelBytesInSet(i, int64(ms.Total().BytesIn))
+		wk.metrics.LevelBytesIngestedSet(i, int64(ms.Total().BytesIngested))
+		wk.metrics.LevelBytesMovedSet(i, int64(ms.Total().BytesMoved))
+		wk.metrics.LevelBytesReadSet(i, int64(ms.Total().BytesRead))
+		wk.metrics.LevelBytesCompactedSet(i, int64(ms.Total().BytesCompacted))
+		wk.metrics.LevelBytesFlushedSet(i, int64(ms.Total().BytesFlushed))
+		wk.metrics.LevelTablesCompactedSet(i, int64(ms.Total().TablesCompacted))
+		wk.metrics.LevelTablesFlushedSet(i, int64(ms.Total().TablesFlushed))
+		wk.metrics.LevelTablesIngestedSet(i, int64(ms.Total().TablesIngested))
+		wk.metrics.LevelTablesMovedSet(i, int64(ms.Total().TablesMoved))
 
 	}
 }
