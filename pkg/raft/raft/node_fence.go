@@ -18,14 +18,22 @@ func (n *Node) fenceEnabled() bool {
 // FenceElection runs only on the owner, before any report reads durable logs.
 // The caller must compare expect with the applied authority before invoking it.
 func (n *Node) FenceElection(expect types.Config, term uint32) error {
-	if n.opts.SaveHardState == nil || n.Diverged() || term == 0 || term <= expect.Term ||
-		n.cfg.Term > term || n.safetyState.InstalledTerm >= term || !n.matchesFenceExpected(expect, term) {
-		return ErrElectionNotInstalled
+	if n.opts.SaveHardState == nil {
+		return n.fenceError("persistence-unavailable", expect, term, ErrElectionNotInstalled)
+	}
+	if n.Diverged() {
+		return n.fenceError("diverged", expect, term, ErrElectionNotInstalled)
+	}
+	if term == 0 || term <= expect.Term || n.cfg.Term > term || n.safetyState.InstalledTerm >= term {
+		return n.fenceError("term", expect, term, ErrElectionNotInstalled)
+	}
+	if !n.matchesFenceExpected(expect, term) {
+		return n.fenceError("identity", expect, term, ErrElectionNotInstalled)
 	}
 	if n.pendingCommit > n.queue.committedIndex {
 		index := n.pendingCommit
 		if !n.persistCommit(index) {
-			return ErrElectionNotInstalled
+			return n.fenceError("commit-persistence", expect, term, ErrElectionNotInstalled)
 		}
 		n.queue.committedIndex = index
 	}
@@ -45,11 +53,11 @@ func (n *Node) FenceElection(expect types.Config, term uint32) error {
 	}
 	state := n.hardState()
 	if err := n.opts.SaveHardState(state); err != nil {
-		return err
+		return n.fenceError("fence-persistence", expect, term, err)
 	}
 	n.persistedHardState = state
 	if n.pendingStore != nil || n.truncating {
-		return ErrElectionNotInstalled
+		return n.fenceError("draining", expect, term, ErrElectionNotInstalled)
 	}
 	return nil
 }

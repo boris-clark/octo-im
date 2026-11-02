@@ -195,16 +195,17 @@ func (s *Server) fenceChannelConfig(ctx context.Context, cfg *wkdb.ChannelCluste
 	if !current.Equal(expected) {
 		return false, raft.ErrConfigVersionStale
 	}
-	reports, err := s.requestElectionFences(ctx, channelElectionConfig(expected), electionFenceRequest{Channel: &expected, Term: term})
+	collection, err := s.collectElectionFences(ctx, channelElectionConfig(expected), electionFenceRequest{Channel: &expected, Term: term})
 	if err != nil {
-		return false, err
+		return false, errors.Join(err, collection.refusalError())
 	}
+	reports := collection.reports
 	leader, err := rafttypes.SelectFencedLeader(channelElectionConfig(expected), term, reports)
 	if err != nil {
 		if current, readErr := s.loadConversationConfigLocal(ctx, expected.ChannelId, expected.ChannelType); readErr == nil && !current.Equal(expected) {
 			return false, raft.ErrConfigVersionStale
 		}
-		return false, fmt.Errorf("%w: %w", ErrConversationReadRetry, err)
+		return false, fmt.Errorf("%w: %w", ErrConversationReadRetry, errors.Join(err, collection.refusalError()))
 	}
 	cfg.LeaderId = leader
 	cfg.Term = term

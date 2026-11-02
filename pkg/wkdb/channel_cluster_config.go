@@ -43,6 +43,12 @@ func (wk *wukongDB) SaveChannelClusterConfig(channelClusterConfig ChannelCluster
 			return nil
 		}
 	} else if !IsEmptyChannelClusterConfig(current) {
+		// A certified identity's version participates in durable voter fences.
+		// Only a conditional new installation may advance it. Admission must
+		// obtain the old quorum first; slot replay must not publish a raw hint.
+		if channelClusterConfig.ConfVersion != current.ConfVersion {
+			return nil
+		}
 		if current.Term != channelClusterConfig.Term || current.LeaderId != channelClusterConfig.LeaderId || current.InstalledTerm != channelClusterConfig.InstalledTerm || current.BoundaryTerm != channelClusterConfig.BoundaryTerm {
 			return nil
 		}

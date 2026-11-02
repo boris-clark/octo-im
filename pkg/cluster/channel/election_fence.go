@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -24,12 +25,14 @@ func (s *Server) FenceElection(ctx context.Context, expected wkdb.ChannelCluster
 	}
 	err := s.getRaftGroup(key).Do(ctx, key, func(r raftgroup.IRaft) error {
 		ch := r.(*Channel)
-		// The caller has compared the complete applied authority. A version-only
-		// metadata update can precede its runtime hint; adopt that version before
-		// fencing, while never reactivating an already pending old-term fence.
-		if !ch.PendingElectionFence() && ch.Config().Version < expected.ConfVersion {
+		// The caller has compared the complete applied authority. Finish a
+		// certified installation before fencing its new identity, even when its
+		// hint lost the race with this request. A metadata-only version advance
+		// below the durable fence still cannot reactivate the old leader.
+		canInstall := !ch.PendingElectionFence() || expected.InstalledTerm == expected.Term && expected.Term >= ch.Config().Term
+		if canInstall && ch.Config().Version < expected.ConfVersion {
 			if err := ch.applyConfigOnOwner(channelConfigToRaftConfig(s.opts.NodeId, expected)); err != nil {
-				return err
+				return raft.NewElectionFenceError("config-install", channelConfigToRaftConfig(s.opts.NodeId, expected), ch.Config(), term, err)
 			}
 		}
 		if err := ch.Node.FenceElection(channelConfigToRaftConfig(s.opts.NodeId, expected), term); err != nil {
@@ -37,7 +40,7 @@ func (s *Server) FenceElection(ctx context.Context, expected wkdb.ChannelCluster
 		}
 		state, err := s.storage.GetState(expected.ChannelId, expected.ChannelType)
 		if err != nil {
-			return err
+			return raft.NewElectionFenceError("durable-read", channelConfigToRaftConfig(s.opts.NodeId, expected), ch.Config(), term, err)
 		}
 		report = types.ElectionReport{Identity: types.ElectionIdentity(channelConfigToRaftConfig(s.opts.NodeId, expected)), NodeID: s.opts.NodeId, Term: term, LastIndex: state.LastLogIndex, LastTerm: state.LastTerm, Floor: state.HardState.CommittedFloor, BoundaryTerm: state.HardState.BoundaryTerm, Fenced: state.HardState.FenceTerm == term && state.HardState.InstalledTerm < term && !state.Diverged}
 		return nil

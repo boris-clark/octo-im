@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -41,10 +42,11 @@ func (s *Server) certifyChannelMembership(ctx context.Context, old wkdb.ChannelC
 		return raft.ErrConfigVersionStale
 	}
 	term := max(next.Term, old.Term+1)
-	reports, err := s.requestElectionFences(ctx, channelElectionConfig(old), electionFenceRequest{Channel: &old, Term: term, IncludeLearners: true})
+	collection, err := s.collectElectionFences(ctx, channelElectionConfig(old), electionFenceRequest{Channel: &old, Term: term, IncludeLearners: true})
 	if err != nil {
-		return err
+		return errors.Join(err, collection.refusalError())
 	}
+	reports := collection.reports
 	next.Term, next.InstalledTerm = term, term
 	next.Expected = &old
 	next.Membership = &rt.MembershipCertificate{Reports: reports}
@@ -54,7 +56,7 @@ func (s *Server) certifyChannelMembership(ctx context.Context, old wkdb.ChannelC
 		}
 	}
 	if err := rt.ValidateMembershipInstall(channelElectionConfig(old), channelElectionConfig(*next), next.Membership); err != nil {
-		return fmt.Errorf("%w: %w", ErrConversationReadRetry, err)
+		return fmt.Errorf("%w: %w", ErrConversationReadRetry, errors.Join(err, collection.refusalError()))
 	}
 	return nil
 }

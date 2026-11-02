@@ -3,7 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
-	"slices"
+	"math"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
@@ -53,26 +53,31 @@ func (s *Server) saveChannelConfigLocked(ctx context.Context, cfg wkdb.ChannelCl
 			if current.ConfVersion != cfg.ConfVersion {
 				return 0, raft.ErrConfigVersionStale
 			}
-			if !wkdb.IsEmptyChannelClusterConfig(current) && current.InstalledTerm != 0 && !sameChannelMembership(current, cfg) {
+			if cfg.Expected != nil && !current.Equal(*cfg.Expected) {
+				return 0, raft.ErrConfigVersionStale
+			}
+			if !wkdb.IsEmptyChannelClusterConfig(current) && !sameChannelMembership(current, cfg) {
 				if err := s.certifyChannelMembership(ctx, current, &cfg); err != nil {
 					return 0, err
 				}
 			}
-			if cfg.Expected == nil && !wkdb.IsEmptyChannelClusterConfig(current) &&
-				(cfg.Term != current.Term || cfg.LeaderId != current.LeaderId) {
-				// Term/leader callbacks are proposals to the authority, not
-				// certificates. Fence the applied voters before publishing them.
-				if !slices.Equal(cfg.Replicas, current.Replicas) || !slices.Equal(cfg.Learners, current.Learners) ||
-					cfg.MigrateFrom != current.MigrateFrom || cfg.MigrateTo != current.MigrateTo || cfg.Term <= current.Term {
+			if !wkdb.IsEmptyChannelClusterConfig(current) && sameChannelMembership(current, cfg) {
+				// Slot apply assigns a new ConfVersion even to an identical save.
+				// That changes persistedFenceIdentity. Stop the OLD applied voters
+				// and complete a new install before publishing any new version;
+				// a partial fence must never be stranded by a metadata-only write.
+				if cfg.Term < current.Term || current.Term == math.MaxUint32 ||
+					cfg.Term == current.Term && cfg.LeaderId != current.LeaderId {
 					return 0, raft.ErrElectionNotInstalled
 				}
 				certified := current.Clone()
-				if _, err := s.fenceChannelConfig(ctx, &certified, cfg.Term); err != nil {
+				if _, err := s.fenceChannelConfig(ctx, &certified, max(cfg.Term, current.Term+1)); err != nil {
 					return 0, err
 				}
-				if certified.LeaderId != cfg.LeaderId {
+				if cfg.Term > current.Term && certified.LeaderId != cfg.LeaderId {
 					return 0, ErrConversationReadRetry
 				}
+				cfg.Term, cfg.LeaderId = certified.Term, certified.LeaderId
 				cfg.Expected = &current
 				cfg.InstalledTerm, cfg.BoundaryTerm = certified.InstalledTerm, certified.BoundaryTerm
 			}

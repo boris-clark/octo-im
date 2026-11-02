@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
+	"regexp"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -263,9 +264,39 @@ func (r *rpcClient) requestWithContext(ctx context.Context, nodeId uint64, path 
 	if resp.Status == slotReplicaDiverged {
 		return nil, fmt.Errorf("%w: rpc %s refused by node %d: %s", rafttypes.ErrSlotDiverged, path, nodeId, resp.Body)
 	}
+	if path == "/rpc/election/fence" {
+		return nil, &fenceRPCError{status: resp.Status, reason: safeFenceRefusal(resp.Body)}
+	}
 
 	return nil, fmt.Errorf("rpc request failed, status: %d", resp.Status)
 
+}
+
+type fenceRPCError struct {
+	status proto.Status
+	reason string
+}
+
+func (e *fenceRPCError) Error() string {
+	return fmt.Sprintf("fence RPC status=%d: %s", e.status, e.reason)
+}
+
+var fenceRefusalPattern = regexp.MustCompile(`^election fence phase=[a-z-]+ requested_term=[0-9]+ expected_term=[0-9]+ current_term=[0-9]+ expected_version=[0-9]+ current_version=[0-9]+ expected_identity=[0-9a-f]{64} current_identity=[0-9a-f]{64} expected_fence=[0-9a-f]{64} current_fence=[0-9a-f]{64}$`)
+
+// Accept only our bounded authority format, plus known older-peer refusals.
+// Arbitrary peer bodies can contain storage paths, addresses or credentials.
+func safeFenceRefusal(body []byte) string {
+	if len(body) <= 768 && fenceRefusalPattern.Match(body) {
+		return string(body)
+	}
+	switch string(body) {
+	case "election has no matching applied install":
+		return "election fence phase=identity"
+	case "slot fence expected identity is not applied", "channel fence expected identity is not applied":
+		return "election fence phase=applied-identity"
+	default:
+		return "election fence phase=receiver"
+	}
 }
 
 type channelReq struct {
