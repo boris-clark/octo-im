@@ -89,13 +89,17 @@ var sendResultPolicy = forward.CapabilityPolicy{
 	ProbeSteps:    capabilityProbeSteps,
 	SendReserve:   capabilitySendReserve,
 	OnProbe: func(class string, latency time.Duration) {
-		if trace.GlobalTrace != nil {
-			trace.GlobalTrace.Metrics.App().SendResultCapabilityProbeOb(class, latency.Milliseconds())
+		currentTrace := trace.GetGlobalTrace()
+
+		if currentTrace != nil {
+			currentTrace.Metrics.App().SendResultCapabilityProbeOb(class, latency.Milliseconds())
 		}
 	},
 	OnStaleServe: func() {
-		if trace.GlobalTrace != nil {
-			trace.GlobalTrace.Metrics.App().SendResultCapabilityStaleServeAdd(1)
+		currentTrace := trace.GetGlobalTrace()
+
+		if currentTrace != nil {
+			currentTrace.Metrics.App().SendResultCapabilityStaleServeAdd(1)
 		}
 	},
 }
@@ -227,6 +231,8 @@ wait:
 
 // notPersisted records why a send ends in 503 with no attempt in flight.
 func (a *sendAcker) notPersisted(channelId string, attempts int, r readiness) {
+	currentTrace := trace.GetGlobalTrace()
+
 	reason := r.reason
 	switch {
 	case reason != "":
@@ -243,8 +249,8 @@ func (a *sendAcker) notPersisted(channelId string, attempts int, r readiness) {
 		zap.String("probe_err_class", r.verdict.ErrClass),
 		zap.String("channelId", channelId),
 		zap.Int("attempts", attempts))
-	if trace.GlobalTrace != nil {
-		trace.GlobalTrace.Metrics.App().APISendNotPersistedAdd(reason)
+	if currentTrace != nil {
+		currentTrace.Metrics.App().APISendNotPersistedAdd(reason)
 	}
 }
 

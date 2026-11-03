@@ -79,9 +79,10 @@ func (m *managerServer) stop() {
 }
 
 func (m *managerServer) setRoutes() {
+	currentTrace := trace.GetGlobalTrace()
 
 	// 监控收集
-	metricHandler := trace.GlobalTrace.Handler()
+	metricHandler := currentTrace.Handler()
 	m.r.GET("/metrics", func(c *wkhttp.Context) {
 		metricHandler.ServeHTTP(c.Writer, c.Request)
 	})
@@ -119,7 +120,7 @@ func (m *managerServer) setRoutes() {
 		clusterServer.ServerAPI(m.r, "/cluster")
 	}
 	// 监控
-	trace.GlobalTrace.Route(m.r)
+	currentTrace.Route(m.r)
 
 	// plugin
 	pluginServer := service.PluginManager.(*plugin.Server)

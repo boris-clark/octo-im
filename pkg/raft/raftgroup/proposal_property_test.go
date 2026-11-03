@@ -56,9 +56,11 @@ func TestAdmissionInterleavingProperty(t *testing.T) {
 }
 
 func runAdmissionProperty(t *testing.T, seed int64) {
-	g := newAdmissionGroup(t, []uint64{1}, false)
-	storage := &pausingStorage{memStorage: g.storage, rnd: rand.New(rand.NewSource(seed))}
-	g.opts.Storage = storage
+	// Install the pause facade before attachment: a lease must keep its
+	// original storage object even if Options is changed later.
+	storage := &pausingStorage{memStorage: &memStorage{}, rnd: rand.New(rand.NewSource(seed))}
+	g := newAdmissionGroup(t, []uint64{1}, false, WithStorage(storage))
+	g.storage = storage.memStorage
 	loopRnd := rand.New(rand.NewSource(seed - 1)) // only used on the loop
 	g.setBeforeAdmit(func(uint64) {
 		if loopRnd.Intn(64) == 0 {

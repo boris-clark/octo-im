@@ -8,6 +8,10 @@ import (
 type DB interface {
 	SaveRaftHardState(shardNo string, state types.HardState) error
 	RaftHardState(shardNo string) (types.HardState, error)
+	// Channel replication barriers are separate from user-visible message rows.
+	AppendChannelNoop(shardNo string, log types.Log) error
+	ChannelNoops(shardNo string, start, end uint64) ([]types.Log, error)
+	LastChannelNoop(shardNo string) (types.Log, error)
 	Open() error
 	Close() error
 	// 获取下一个主键
@@ -71,6 +75,7 @@ type MessageDB interface {
 
 	// AppendMessages appends messages to the db.
 	AppendMessages(channelId string, channelType uint8, msgs []Message) error
+	AppendMessagesWithTerm(channelId string, channelType uint8, msgs []Message, term *types.TermStartIndexInfo) error
 
 	// LoadPrevRangeMsgs 向上加载指定范围的消息 end=0表示不做限制 比如 start=100 end=0 limit=10 则返回的消息seq为91-100的消息, 比如 start=100 end=95 limit=10 则返回的消息seq为96-100的消息
 	// 结果包含start,不包含end

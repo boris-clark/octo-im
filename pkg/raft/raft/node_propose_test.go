@@ -133,7 +133,7 @@ func TestLeaderLocalProposeOverlapAfterStoreReq(t *testing.T) {
 	require.Equal(t, before, snapshotQueue(n.queue))
 	require.True(t, n.queue.appending, "in-flight store state untouched")
 
-	require.NoError(t, n.Step(types.Event{Type: types.StoreResp, Index: 2, Reason: types.ReasonOk}))
+	require.NoError(t, n.Step(types.StoreResponse(*store, types.Event{Type: types.StoreResp, Index: 2, Logs: store.Logs, Reason: types.ReasonOk})))
 	require.Equal(t, uint64(2), n.queue.storedIndex)
 	require.Equal(t, uint64(2), n.LastLogIndex())
 

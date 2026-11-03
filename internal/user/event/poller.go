@@ -98,6 +98,8 @@ func (p *poller) loopEvent() {
 }
 
 func (p *poller) tick() {
+	currentTrace := trace.GetGlobalTrace()
+
 	p.tickCount++
 
 	p.waitlist.readHandlers(&p.loopHandlers)
@@ -111,7 +113,7 @@ func (p *poller) tick() {
 			if h.isTimeout() {
 				p.waitlist.remove(h.Uid)
 				if options.G.IsLocalNode(h.leaderId()) {
-					trace.GlobalTrace.Metrics.App().OnlineUserCountAdd(-1)
+					currentTrace.Metrics.App().OnlineUserCountAdd(-1)
 				}
 			}
 		}

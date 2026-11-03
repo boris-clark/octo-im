@@ -77,6 +77,8 @@ message Slot {
     uint64 migrateTo = 8; // 迁移的目标节点
     uint64 expectLeader = 9; // 期望选举到的领导节点
     SlotStatus status = 10; // 槽位状态
+    uint32 installedTerm = 11;
+    uint32 boundaryTerm = 12;
 }
 
 

@@ -12,18 +12,25 @@ import (
 // 处理存储请求
 func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 
-	err := rg.submit(func() {
-		err := rg.opts.Storage.AppendLogs(r.Key(), e.Logs, e.TermStartIndexInfo)
+	op := rg.beginStorageOperation(r, e)
+	if op == nil {
+		return
+	}
+	e = cloneStorageRequest(op.request)
+	err := rg.submitStorageOperation(op, func() {
+		err := storageAppendLogs(op.storage, op.key, e.Logs, e.TermStartIndexInfo)
 		reason := types.ReasonOk
 		if err != nil {
 			if !isDivergence(err) {
-				rg.Panic("append logs failed", zap.Error(err))
+				rg.Error("append logs failed", zap.Error(err))
 			}
-			// Nothing was written. Fence the replica instead of crashing.
-			reason = rg.markDiverged(r.Key(), err)
+			reason = types.ReasonError
+			if isDivergence(err) {
+				reason = rg.markDiverged(op.storage, op.key, err)
+			}
 		}
 
-		rg.AddEvent(r.Key(), localStorageResult(types.Event{
+		rg.completeStorageOperation(op, localStorageResult(types.Event{
 			Type:   types.StoreResp,
 			Index:  e.Logs[len(e.Logs)-1].Index,
 			Logs:   e.Logs,
@@ -33,7 +40,7 @@ func (rg *RaftGroup) handleStoreReq(r IRaft, e types.Event) {
 	})
 	if err != nil {
 		rg.Error("submit append logs failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.StoreResp,
 			Reason: types.ReasonError,
 		})
@@ -55,9 +62,9 @@ func isDivergence(err error) bool {
 // markDiverged persists the divergence marker for a typed storage refusal
 // and returns the local reason for the node: ReasonDiverged when the marker
 // is durable, ReasonDivergedFailStop when it is not (or cannot be) written.
-func (rg *RaftGroup) markDiverged(key string, cause error) types.Reason {
+func (rg *RaftGroup) markDiverged(storage IStorage, key string, cause error) types.Reason {
 	rg.Error("storage refused a request below the applied index; quarantining replica", zap.String("key", key), zap.Error(cause))
-	marker, ok := rg.opts.Storage.(DivergenceMarker)
+	marker, ok := storage.(DivergenceMarker)
 	if !ok {
 		rg.Error("storage cannot persist a divergence marker; replica fail-stopped", zap.String("key", key))
 		return types.ReasonDivergedFailStop
@@ -85,16 +92,21 @@ func localStorageResult(e types.Event) types.Event {
 func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	// Capture mutable Raft state on its owner before launching storage work.
 	lastIndex := r.LastLogIndex()
-	err := rg.submit(func() {
+	op := rg.beginStorageOperation(r, e)
+	if op == nil {
+		return
+	}
+	e = cloneStorageRequest(op.request)
+	err := rg.submitStorageOperation(op, func() {
 		// 获取裁断日志下标
 		var (
 			trunctIndex uint64
 		)
 		if e.Reason != types.ReasonOnlySync {
 			var treason types.Reason
-			trunctIndex, treason = rg.getTrunctLogIndex(r.Key(), lastIndex, e)
+			trunctIndex, treason = rg.getTrunctLogIndex(op.storage, op.key, lastIndex, e)
 			if treason != types.ReasonOk {
-				rg.AddEvent(r.Key(), types.Event{
+				rg.completeStorageOperation(op, types.Event{
 					To:     e.From,
 					Type:   types.GetLogsResp,
 					Reason: treason,
@@ -104,7 +116,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 		}
 		// 需要裁剪
 		if trunctIndex > 0 {
-			rg.AddEvent(r.Key(), types.Event{
+			rg.completeStorageOperation(op, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Index:  trunctIndex,
@@ -114,8 +126,8 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			return
 		}
 		if e.Reason != types.ReasonOnlySync && e.Index > e.StoredIndex {
-			rg.Debug("index is greater than stored index", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
-			rg.AddEvent(r.Key(), types.Event{
+			rg.Debug("index is greater than stored index", zap.String("key", op.key), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
+			rg.completeStorageOperation(op, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Index:  e.Index,
@@ -125,10 +137,10 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			return
 		}
 		// 获取日志数据
-		logs, err := rg.opts.Storage.GetLogs(r.Key(), e.Index, e.StoredIndex+1, rg.opts.MaxLogSizePerBatch)
+		logs, err := storageGetLogs(op.storage, op.key, e.Index, e.StoredIndex+1, rg.opts.MaxLogSizePerBatch)
 		if err != nil {
 			rg.Error("get logs failed", zap.Error(err))
-			rg.AddEvent(r.Key(), types.Event{
+			rg.completeStorageOperation(op, types.Event{
 				To:     e.From,
 				Type:   types.GetLogsResp,
 				Index:  e.Index,
@@ -137,9 +149,9 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 			return
 		}
 		if len(logs) == 0 {
-			rg.Warn("logs is empty", zap.String("key", r.Key()), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
+			rg.Warn("logs is empty", zap.String("key", op.key), zap.Uint64("index", e.Index), zap.Uint64("storedIndex", e.StoredIndex))
 		}
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			To:     e.From,
 			Type:   types.GetLogsResp,
 			Index:  e.Index,
@@ -150,7 +162,7 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 	})
 	if err != nil {
 		rg.Error("submit get logs failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.GetLogsResp,
 			Reason: types.ReasonError,
 		})
@@ -158,19 +170,24 @@ func (rg *RaftGroup) handleGetLogsReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
-	err := rg.submit(func() {
-		err := rg.opts.Storage.TruncateLogTo(r.Key(), e.Index)
+	op := rg.beginStorageOperation(r, e)
+	if op == nil {
+		return
+	}
+	e = cloneStorageRequest(op.request)
+	err := rg.submitStorageOperation(op, func() {
+		err := storageTruncateLogTo(op.storage, op.key, e.Index)
 		if err != nil {
 			reason := types.ReasonError
 			if isDivergence(err) {
 				// The refusal mutated nothing. Newer leader term start
 				// indexes are kept: deleting them would be the second half
 				// of a truncation that did not happen.
-				reason = rg.markDiverged(r.Key(), err)
+				reason = rg.markDiverged(op.storage, op.key, err)
 			} else {
 				rg.Error("truncate logs failed", zap.Error(err))
 			}
-			rg.AddEvent(r.Key(), localStorageResult(types.Event{
+			rg.completeStorageOperation(op, localStorageResult(types.Event{
 				Type:   types.TruncateResp,
 				Index:  e.Index,
 				Reason: reason,
@@ -179,16 +196,18 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 			return
 		}
 		// 删除本地的leader term start index
-		err = rg.opts.Storage.DeleteLeaderTermStartIndexGreaterThanTerm(r.Key(), e.LastLogTerm)
+		if _, atomic := op.storage.(interface{ AtomicLogTruncation() }); !atomic {
+			err = storageDeleteLeaderTermStartIndexGreaterThanTerm(op.storage, op.key, e.LastLogTerm)
+		}
 		if err != nil {
 			rg.Error("delete leader term start index failed", zap.Error(err), zap.Uint32("LastLogTerm", e.LastLogTerm))
-			rg.AddEvent(r.Key(), types.Event{
+			rg.completeStorageOperation(op, types.Event{
 				Type:   types.TruncateResp,
 				Reason: types.ReasonError,
 			})
 			return
 		}
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.TruncateResp,
 			Index:  e.Index,
 			Reason: types.ReasonOk,
@@ -196,7 +215,7 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 	})
 	if err != nil {
 		rg.Error("submit truncate req failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.TruncateResp,
 			Reason: types.ReasonError,
 		})
@@ -204,43 +223,48 @@ func (rg *RaftGroup) handleTruncateReq(r IRaft, e types.Event) {
 }
 
 func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
-	err := rg.submit(func() {
+	op := rg.beginStorageOperation(r, e)
+	if op == nil {
+		return
+	}
+	e = cloneStorageRequest(op.request)
+	err := rg.submitStorageOperation(op, func() {
 		// 已提交
-		// rg.wait.didCommit(r.Key(), e.EndIndex-1)
+		// rg.wait.didCommit(op.key, e.EndIndex-1)
 		var (
 			lastLogIndex uint64
 			logs         []types.Log
 			err          error
 		)
-		if storage, ok := rg.opts.Storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
-			if err := storage.ApplyCommittedRange(r.Key(), e.StartIndex, e.EndIndex); err != nil {
+		if storage, ok := op.storage.(CommittedRangeApplier); ok && !rg.opts.NotNeedApplied {
+			if err := storage.ApplyCommittedRange(op.key, e.StartIndex, e.EndIndex); err != nil {
 				rg.Error("apply committed range failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{Type: types.ApplyResp, Reason: types.ReasonError})
+				rg.completeStorageOperation(op, types.Event{Type: types.ApplyResp, Reason: types.ReasonError})
 				return
 			}
 			lastLogIndex = e.EndIndex - 1
 		} else if !rg.opts.NotNeedApplied {
-			logs, err = rg.opts.Storage.GetLogs(r.Key(), e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
+			logs, err = storageGetLogs(op.storage, op.key, e.StartIndex, min(e.EndIndex, e.StartIndex+1000), rg.opts.MaxLogSizePerBatch)
 			if err != nil {
 				rg.Error("get logs failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.completeStorageOperation(op, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
 				return
 			}
 			if len(logs) == 0 {
-				rg.Error("logs is empty", zap.String("key", r.Key()), zap.Uint64("startIndex", e.StartIndex), zap.Uint64("endIndex", e.EndIndex))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.Error("logs is empty", zap.String("key", op.key), zap.Uint64("startIndex", e.StartIndex), zap.Uint64("endIndex", e.EndIndex))
+				rg.completeStorageOperation(op, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
 				return
 			}
-			err = rg.opts.Storage.Apply(r.Key(), logs)
+			err = storageApply(op.storage, op.key, logs)
 			if err != nil {
 				rg.Error("apply logs failed", zap.Error(err))
-				rg.AddEvent(r.Key(), types.Event{
+				rg.completeStorageOperation(op, types.Event{
 					Type:   types.ApplyResp,
 					Reason: types.ReasonError,
 				})
@@ -251,18 +275,18 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 			lastLogIndex = e.EndIndex - 1
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonOk,
 			Index:  lastLogIndex,
+			Logs:   logs,
 		})
 		// 已应用：按回执身份完成等待者（NotNeedApplied 时 logs 为 nil）
-		rg.wait.didApply(r.Key(), lastLogIndex, logs)
 		rg.Advance()
 	})
 	if err != nil {
 		rg.Error("submit apply req failed", zap.Error(err))
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   types.ApplyResp,
 			Reason: types.ReasonError,
 		})
@@ -270,8 +294,8 @@ func (rg *RaftGroup) handleApplyReq(r IRaft, e types.Event) {
 }
 
 // 根据副本的同步数据，来获取副本的需要裁剪的日志下标，如果不需要裁剪，则返回0
-func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Event) (uint64, types.Reason) {
-	leaderLastLogTerm, err := rg.opts.Storage.LeaderLastLogTerm(key)
+func (rg *RaftGroup) getTrunctLogIndex(storage IStorage, key string, lastIndex uint64, e types.Event) (uint64, types.Reason) {
+	leaderLastLogTerm, err := storageLeaderLastLogTerm(storage, key)
 	if err != nil {
 		rg.Error("get leader last log term failed", zap.Error(err))
 		return 0, types.ReasonError
@@ -294,13 +318,13 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 
 	// 如果副本的最新日志任期小于当前领导的最新日志任期，则需要裁剪
 	if e.LastLogTerm < leaderLastLogTerm {
-		term, err := rg.opts.Storage.LeaderTermGreaterEqThan(key, e.LastLogTerm+1)
+		term, err := storageLeaderTermGreaterEqThan(storage, key, e.LastLogTerm+1)
 		if err != nil {
 			rg.Error("LeaderTermGreaterEqThan: get leader last term failed", zap.Error(err))
 			return 0, types.ReasonError
 		}
 		// 获取副本的最新日志任期+1的开始日志下标
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, term)
+		termStartIndex, err := storageGetTermStartIndex(storage, key, term)
 		if err != nil {
 			rg.Error("get term start index failed", zap.Error(err))
 			return 0, types.ReasonError
@@ -310,7 +334,7 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 		}
 		return termStartIndex, types.ReasonOk
 	} else {
-		termStartIndex, err := rg.opts.Storage.GetTermStartIndex(key, leaderLastLogTerm)
+		termStartIndex, err := storageGetTermStartIndex(storage, key, leaderLastLogTerm)
 		if err != nil {
 			rg.Error("get term start index failed", zap.Error(err))
 			return 0, types.ReasonError
@@ -325,7 +349,14 @@ func (rg *RaftGroup) getTrunctLogIndex(key string, lastIndex uint64, e types.Eve
 
 func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
-	err := rg.submit(func() {
+	cfg := r.Config().Clone()
+	leaderID := r.LeaderId()
+	op := rg.beginStorageOperation(r, e)
+	if op == nil {
+		return
+	}
+	e = cloneStorageRequest(op.request)
+	err := rg.submitStorageOperation(op, func() {
 
 		var (
 			newCfg        types.Config
@@ -335,9 +366,9 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 		switch e.Type {
 		case types.LearnerToLeaderReq,
 			types.LearnerToFollowerReq:
-			newCfg, err = rg.learnTo(r, e.From)
+			newCfg, err = rg.learnTo(cfg, leaderID, e.From)
 			if err != nil {
-				rg.Error("learn switch failed", zap.Error(err), zap.String("key", r.Key()), zap.String("type", e.Type.String()), zap.String("cfg", r.Config().String()))
+				rg.Error("learn switch failed", zap.Error(err), zap.String("key", op.key), zap.String("type", e.Type.String()), zap.String("cfg", cfg.String()))
 			}
 			if e.Type == types.LearnerToFollowerReq {
 				respEventType = types.LearnerToFollowerResp
@@ -345,9 +376,9 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 				respEventType = types.LearnerToLeaderResp
 			}
 		case types.FollowerToLeaderReq:
-			newCfg, err = rg.followerToLeader(r, e.From)
+			newCfg, err = rg.followerToLeader(cfg, e.From)
 			if err != nil {
-				rg.Error("follower switch to leader failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", r.Config().String()))
+				rg.Error("follower switch to leader failed", zap.Error(err), zap.String("key", op.key), zap.String("cfg", cfg.String()))
 			}
 			respEventType = types.FollowerToLeaderResp
 		default:
@@ -355,7 +386,7 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 		}
 
 		if err != nil {
-			rg.AddEvent(r.Key(), types.Event{
+			rg.completeStorageOperation(op, types.Event{
 				Type:   respEventType,
 				From:   e.From,
 				Reason: types.ReasonError,
@@ -363,19 +394,19 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 			return
 		}
 
-		err = rg.opts.Storage.SaveConfig(r.Key(), newCfg)
+		err = storageSaveConfig(op.storage, op.key, newCfg)
 		if err != nil {
 			if err != types.ErrNotLeader {
-				rg.Error("change role failed", zap.Error(err), zap.String("key", r.Key()), zap.String("cfg", newCfg.String()))
+				rg.Error("change role failed", zap.Error(err), zap.String("key", op.key), zap.String("cfg", newCfg.String()))
 			}
-			rg.AddEvent(r.Key(), types.Event{
+			rg.completeStorageOperation(op, types.Event{
 				Type:   respEventType,
 				From:   e.From,
 				Reason: types.ReasonError,
 			})
 			return
 		}
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   respEventType,
 			From:   e.From,
 			Reason: types.ReasonOk,
@@ -397,7 +428,7 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 			respEventType = types.FollowerToLeaderResp
 		}
 
-		rg.AddEvent(r.Key(), types.Event{
+		rg.completeStorageOperation(op, types.Event{
 			Type:   respEventType,
 			From:   e.From,
 			Reason: types.ReasonError,
@@ -406,11 +437,11 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 }
 
 // 学习者转换
-func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
-	if !wkutil.ArrayContainsUint64(r.Config().Learners, learnerId) {
+func (rg *RaftGroup) learnTo(cfg types.Config, leaderID uint64, learnerId uint64) (types.Config, error) {
+	if !wkutil.ArrayContainsUint64(cfg.Learners, learnerId) {
 		return types.Config{}, errors.New("promotion target is not a learner")
 	}
-	cfg := r.Config().Clone()
+	cfg = cfg.Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
 	// 但 learnerId 仍残留在 cfg.Learners 中。此时既无迁移源也无迁移目标，
@@ -440,7 +471,7 @@ func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
 			cfg.Replicas = wkutil.RemoveUint64(cfg.Replicas, cfg.MigrateFrom)
 		}
 
-		if cfg.MigrateFrom == r.LeaderId() { // 学习者转领导
+		if cfg.MigrateFrom == leaderID { // 学习者转领导
 			cfg.Leader = cfg.MigrateTo
 		}
 	}
@@ -452,8 +483,8 @@ func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
 }
 
 // follower转换成leader
-func (rg *RaftGroup) followerToLeader(r IRaft, followerId uint64) (types.Config, error) {
-	cfg := r.Config().Clone()
+func (rg *RaftGroup) followerToLeader(cfg types.Config, followerId uint64) (types.Config, error) {
+	cfg = cfg.Clone()
 	if !wkutil.ArrayContainsUint64(cfg.Replicas, followerId) {
 		rg.Error("followerToLeader: follower not in replicas", zap.Uint64("followerId", followerId))
 		return types.Config{}, fmt.Errorf("follower not in replicas")
@@ -469,5 +500,41 @@ func (rg *RaftGroup) followerToLeader(r IRaft, followerId uint64) (types.Config,
 }
 
 func (rg *RaftGroup) handleDestory(r IRaft) {
-	rg.RemoveRaft(r)
+	rg.removeRaft(r)
+}
+
+func storageAppendLogs(s IStorage, key string, logs []types.Log, info *types.TermStartIndexInfo) error {
+	return s.AppendLogs(key, logs, info)
+}
+
+func storageGetLogs(s IStorage, key string, start, end, limit uint64) ([]types.Log, error) {
+	return s.GetLogs(key, start, end, limit)
+}
+
+func storageTruncateLogTo(s IStorage, key string, index uint64) error {
+	return s.TruncateLogTo(key, index)
+}
+
+func storageDeleteLeaderTermStartIndexGreaterThanTerm(s IStorage, key string, term uint32) error {
+	return s.DeleteLeaderTermStartIndexGreaterThanTerm(key, term)
+}
+
+func storageApply(s IStorage, key string, logs []types.Log) error {
+	return s.Apply(key, logs)
+}
+
+func storageLeaderLastLogTerm(s IStorage, key string) (uint32, error) {
+	return s.LeaderLastLogTerm(key)
+}
+
+func storageLeaderTermGreaterEqThan(s IStorage, key string, term uint32) (uint32, error) {
+	return s.LeaderTermGreaterEqThan(key, term)
+}
+
+func storageGetTermStartIndex(s IStorage, key string, term uint32) (uint64, error) {
+	return s.GetTermStartIndex(key, term)
+}
+
+func storageSaveConfig(s IStorage, key string, cfg types.Config) error {
+	return s.SaveConfig(key, cfg)
 }

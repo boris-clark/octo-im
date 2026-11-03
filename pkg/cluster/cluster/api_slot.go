@@ -383,21 +383,20 @@ func (s *Server) slotReplicasGet(c *wkhttp.Context) {
 			return
 		}
 		if replicaId == s.opts.ConfigOptions.NodeId {
-			slotRaft := s.slotServer.GetSlotRaft(slotId)
-			running := 0
-			var leaderId uint64
-			var term uint32
-			var confVersion uint64
-			var appliedIndex uint64
-			var committedIndex uint64
-			if slotRaft != nil {
-				running = 1
-				leaderId = slotRaft.LeaderId()
-				term = slotRaft.Config().Term
-				confVersion = slotRaft.Config().Version
-				appliedIndex = slotRaft.AppliedIndex()
-				committedIndex = slotRaft.CommittedIndex()
+			ownerState, err := s.slotServer.ReadLeaderState(timeoutCtx, slotId)
+			if err != nil {
+				c.ResponseError(err)
+				return
 			}
+			running := 0
+			if ownerState.Exists {
+				running = 1
+			}
+			leaderId := ownerState.LeaderID
+			term := ownerState.Term
+			confVersion := ownerState.ConfigVersion
+			appliedIndex := ownerState.AppliedIndex
+			committedIndex := ownerState.CommittedIndex
 
 			replicaResp := slotReplicaResp{
 				ReplicaId:      s.opts.ConfigOptions.NodeId,
@@ -493,21 +492,22 @@ func (s *Server) slotLocalReplicaGet(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
-	slotRaft := s.slotServer.GetSlotRaft(slotId)
-	running := 0
-	var leaderId uint64
-	var term uint32
-	var confVersion uint64
-	var appliedIndex uint64
-	var committedIndex uint64
-	if slotRaft != nil {
-		running = 1
-		leaderId = slotRaft.LeaderId()
-		term = slotRaft.Config().Term
-		confVersion = slotRaft.Config().Version
-		appliedIndex = slotRaft.AppliedIndex()
-		committedIndex = slotRaft.CommittedIndex()
+	readCtx, cancel := context.WithTimeout(s.cancelCtx, s.opts.ReqTimeout)
+	defer cancel()
+	ownerState, err := s.slotServer.ReadLeaderState(readCtx, slotId)
+	if err != nil {
+		c.ResponseError(err)
+		return
 	}
+	running := 0
+	if ownerState.Exists {
+		running = 1
+	}
+	leaderId := ownerState.LeaderID
+	term := ownerState.Term
+	confVersion := ownerState.ConfigVersion
+	appliedIndex := ownerState.AppliedIndex
+	committedIndex := ownerState.CommittedIndex
 
 	replicaResp := slotReplicaResp{
 		ReplicaId:      s.opts.ConfigOptions.NodeId,

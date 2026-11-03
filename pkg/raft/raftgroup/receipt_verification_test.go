@@ -136,6 +136,7 @@ func TestReceiptVerificationSchedules(t *testing.T) {
 		for _, outcome := range []string{"match", "mismatch", "storage-error", "missing", "overload", "stopped"} {
 			t.Run(outcome+map[bool]string{true: "/apply-first", false: "/register-first"}[before], func(t *testing.T) {
 				g := New(NewOptions(WithGoPoolSize(1)))
+				require.NoError(t, g.AddRaft(&waitTestRaft{}))
 				gate := make(chan struct{})
 				var once sync.Once
 				release := func() { once.Do(func() { close(gate) }) }
@@ -170,13 +171,13 @@ func TestReceiptVerificationSchedules(t *testing.T) {
 					stopVerificationGroup(g)
 				}
 				if before {
-					g.wait.didApply(admKey, 1, nil)
+					g.wait.didApply("slot", 1, nil)
 				}
-				w, applied := g.wait.register(receipt{raftKey: admKey, seq: 1, first: 1, last: 1, logs: []types.Log{{Id: 7, Index: 1}}, forwarded: true})
+				w, applied := g.wait.register(receipt{lease: g.storageLeases["slot"], raftKey: "slot", seq: 1, first: 1, last: 1, logs: []types.Log{{Id: 7, Index: 1}}, forwarded: true})
 				if applied {
 					g.wait.verifyStored(w)
 				} else {
-					g.wait.didApply(admKey, 1, nil)
+					g.wait.didApply("slot", 1, nil)
 				}
 				var err error
 				select {

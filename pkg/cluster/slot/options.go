@@ -22,7 +22,11 @@ type Options struct {
 	// api接口
 	RPC icluster.RPC
 	// OnApply 应用日志回调
-	OnApply func(slotId uint32, logs []types.Log) error
+	// OnApplyWithReads supplies scoped reads without reacquiring storage authority.
+	OnApplyWithReads func(slotId uint32, logs []types.Log, reads *CallbackReads) error
+	// OnSaveConfigWithReads has the same completion semantics as OnSaveConfig.
+	OnSaveConfigWithReads func(slotId uint32, cfg types.Config, reads *CallbackReads) error
+	OnApply               func(slotId uint32, logs []types.Log) error
 
 	// OnSaveConfig 保存槽配置
 	OnSaveConfig func(slotId uint32, cfg types.Config) error

@@ -61,6 +61,14 @@ func (d *retryHookDB) AppendMessages(id string, typ uint8, m []wkdb.Message) err
 	}
 	return d.DB.AppendMessages(id, typ, m)
 }
+
+// Keep the existing blocked-store oracle on the atomic append port.
+func (d *retryHookDB) AppendMessagesWithTerm(id string, typ uint8, m []wkdb.Message, term *types.TermStartIndexInfo) error {
+	if d.appendEntered != nil {
+		d.once.Do(func() { close(d.appendEntered); <-d.appendRelease })
+	}
+	return d.DB.AppendMessagesWithTerm(id, typ, m, term)
+}
 func (d *retryHookDB) UpdateChannelAppliedIndex(id string, typ uint8, idx uint64) error {
 	if d.beforeApply != nil {
 		d.beforeApply()
@@ -82,15 +90,17 @@ func retryServer(t *testing.T, id uint64, db wkdb.DB, replicas []uint64, tr *ret
 	s := NewServer(NewOptions(WithNodeId(id), WithDB(db), WithGroupCount(1), WithTransport(tr)))
 	require.NoError(t, s.Start())
 	t.Cleanup(func() { stopServer(t, s) })
-	tr.mu.Lock()
-	tr.nodes[id] = s
-	tr.mu.Unlock()
 	cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: replicas, Term: 1, ConfVersion: 1}
 	rg := s.getRaftGroup(wkutil.ChannelToKey("retry", 2))
 	ch, err := createChannel(cfg, s, rg)
 	require.NoError(t, err)
 	rg.AddRaft(ch)
 	require.NoError(t, ch.switchConfig(channelConfigToRaftConfig(id, cfg)))
+	// Publish this fixture endpoint only after its owner exists. These direct
+	// storage fixtures intentionally have no controller-backed dormant wake path.
+	tr.mu.Lock()
+	tr.nodes[id] = s
+	tr.mu.Unlock()
 	return s
 }
 func retryNetwork() *retryTransport {

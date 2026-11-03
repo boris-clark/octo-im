@@ -93,11 +93,12 @@ func proposeAndStore(n *Node, data []byte) uint64 {
 	for _, e := range events {
 		if e.Type == types.StoreReq {
 			lastIdx := e.Logs[len(e.Logs)-1].Index
-			n.Step(types.Event{
+			n.Step(types.StoreResponse(e, types.Event{
+				Logs:   e.Logs,
 				Type:   types.StoreResp,
 				Index:  lastIdx,
 				Reason: types.ReasonOk,
-			})
+			}))
 			collectEvents(n) // drain events from StoreResp
 			return lastIdx
 		}
@@ -192,4 +193,20 @@ func TestTermStartIndex_Tracking(t *testing.T) {
 	n.updateLastTermStartIndex(5, 100)
 	assert.Equal(t, uint32(5), n.lastTermStartIndex.Term)
 	assert.Equal(t, uint64(100), n.lastTermStartIndex.Index)
+}
+
+// completePendingStore models an owner-issued local storage response. Codec
+// and forgery tests deliberately use raw responses instead of this fixture.
+func completePendingStore(n *Node, e types.Event) {
+	if n.pendingStore == nil {
+		n.Ready()
+	}
+	if n.pendingStore == nil {
+		panic("test has no outstanding store request")
+	}
+	req := n.pendingStore.Request()
+	if e.Reason == types.ReasonOk {
+		e.Logs = req.Logs[:e.Index-req.Logs[0].Index+1]
+	}
+	n.Step(types.StoreResponse(req, e))
 }

@@ -2,9 +2,22 @@ package clusterconfig
 
 import (
 	"encoding/binary"
+	"errors"
+	"slices"
 
 	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"go.uber.org/zap"
+)
+
+var (
+	ErrSlotMigrateInvalidEndpoint    = errors.New("slot migrate endpoints are invalid")
+	ErrSlotMigrateSlotNotFound       = errors.New("slot not found")
+	ErrSlotMigrateInProgress         = errors.New("slot migration is already in progress")
+	ErrSlotMigrateSourceNotReplica   = errors.New("slot migrate source is not a replica")
+	ErrSlotMigrateFollowerToFollower = errors.New("slot transition between followers is not supported")
+	ErrSlotMigrateTargetOffline      = errors.New("slot migrate target is not an online voting node")
+	ErrSlotMigrateNotInstalled       = errors.New("installed slot migration requires certified slot authority")
+	ErrSlotMigrateRejected           = errors.New("slot migration was rejected by applied state")
 )
 
 // 提案配置
@@ -159,8 +172,36 @@ func (s *Server) ProposeJoin(node *pb.Node) error {
 
 // ProposeMigrateSlot 提案槽迁移
 func (s *Server) ProposeMigrateSlot(slotId uint32, fromNodeId, toNodeId uint64) error {
-	if fromNodeId == toNodeId {
-		return nil
+	if fromNodeId == 0 || toNodeId == 0 || fromNodeId == toNodeId {
+		return ErrSlotMigrateInvalidEndpoint
+	}
+	slot := s.Slot(slotId)
+	if slot == nil {
+		return ErrSlotMigrateSlotNotFound
+	}
+	if slot.MigrateFrom != 0 || slot.MigrateTo != 0 || len(slot.Learners) > 0 {
+		return ErrSlotMigrateInProgress
+	}
+	if !slices.Contains(slot.Replicas, fromNodeId) {
+		return ErrSlotMigrateSourceNotReplica
+	}
+	if slices.Contains(slot.Replicas, toNodeId) {
+		if fromNodeId != slot.Leader {
+			return ErrSlotMigrateFollowerToFollower
+		}
+	} else {
+		onlineTarget := slices.ContainsFunc(s.AllowVoteAndJoinedOnlineNodes(), func(n *pb.Node) bool {
+			return n != nil && n.Id == toNodeId
+		})
+		if !onlineTarget {
+			return ErrSlotMigrateTargetOffline
+		}
+	}
+	if slot.InstalledTerm != 0 {
+		if s.onProposeMigrateSlot == nil {
+			return ErrSlotMigrateNotInstalled
+		}
+		return s.onProposeMigrateSlot(slotId, fromNodeId, toNodeId)
 	}
 	data, err := EncodeMigrateSlot(slotId, fromNodeId, toNodeId)
 	if err != nil {
@@ -178,6 +219,10 @@ func (s *Server) ProposeMigrateSlot(slotId uint32, fromNodeId, toNodeId uint64) 
 	if err != nil {
 		s.Error("ProposeMigrateSlot failed", zap.Error(err))
 		return err
+	}
+	updated := s.Slot(slotId)
+	if updated == nil || (updated.MigrateFrom != fromNodeId || updated.MigrateTo != toNodeId) && updated.Leader != toNodeId && !slices.Contains(updated.Replicas, toNodeId) {
+		return ErrSlotMigrateRejected
 	}
 
 	return nil

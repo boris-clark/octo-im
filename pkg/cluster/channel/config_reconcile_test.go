@@ -166,12 +166,23 @@ func TestConfigResumeSurvivesHardStateFailure(t *testing.T) {
 	state, err := s.ReadLeaderState(context.Background(), "retry", 2)
 	require.NoError(t, err)
 	require.True(t, state.Ready)
-	require.Equal(t, uint64(1), state.CommittedIndex, "retry must resume the stored tail")
+	require.Equal(t, uint64(2), state.CommittedIndex, "retry must commit a current-term barrier covering the stored tail")
+	logs, err := db.ChannelNoops(wkutil.ChannelToKey("retry", 2), 2, 3)
+	require.NoError(t, err)
+	require.Len(t, logs, 1)
+	require.EqualValues(t, 5, logs[0].Term)
+	require.True(t, types.IsNoop(logs[0]))
+	stored, err := db.LoadMsg("retry", 2, 1)
+	require.NoError(t, err)
+	require.Equal(t, msg, stored)
 	require.Same(t, ch, s.Channel("retry", 2))
 	require.Eventually(t, func() bool {
 		state, err := s.ReadLeaderState(context.Background(), "retry", 2)
-		return err == nil && state.AppliedIndex == 1
+		return err == nil && state.AppliedIndex == 2
 	}, time.Second, time.Millisecond, "finish asynchronous storage before closing the test database")
+	resps, err := s.proposeMessages(context.Background(), "retry", 2, retryRequests(t, retryMessage(2, "alice", "two")))
+	require.NoError(t, err)
+	require.EqualValues(t, 3, resps[0].Index, "continued writes follow the committed barrier")
 }
 
 func TestConfigReconcileLockCancellation(t *testing.T) {
@@ -286,9 +297,12 @@ func TestConfigForegroundWaitsForResume(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
-			want := uint64(1)
+			want := uint64(2) // retained message plus the current-term barrier
+			if mode == "switch" {
+				want = 1 // the initial term already committed the message
+			}
 			if mode == "send" || mode == "send-local" {
-				want = 2
+				want = 3
 			}
 			require.Eventually(t, func() bool {
 				state, err := s.ReadLeaderState(ctx, "retry", 2)

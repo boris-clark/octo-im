@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1451,7 +1452,9 @@ func NewLogRespFromLog(log rafttype.Log, logType LogType) (*LogResp, error) {
 
 	cmdStr := ""
 	cmdContent := ""
-	if logType == LogTypeConfig {
+	if logType == LogTypeSlot && bytes.Equal(log.Data, rafttype.NoopData()) {
+		cmdStr = "Noop"
+	} else if logType == LogTypeConfig {
 		cmd := &clusterconfig.CMD{}
 		err := cmd.Unmarshal(log.Data)
 		if err != nil {

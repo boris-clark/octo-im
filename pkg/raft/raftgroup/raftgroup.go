@@ -15,6 +15,11 @@ import (
 )
 
 type RaftGroup struct {
+	ownerMu           sync.Mutex
+	storageMu         sync.Mutex
+	storageLeases     map[string]*raftLease
+	storageOperations map[*storageOperation]struct{}
+
 	raftList   *linkedList
 	stopper    *syncutil.Stopper
 	opts       *Options
@@ -42,11 +47,13 @@ type RaftGroup struct {
 	// forwardObserve, if set by a test, sees correlation events under forwardMu.
 	forwardObserve func(key, phase, detail string)
 
-	proposalSeq   atomic.Uint64 // receipt identity, unique within the group
-	admissionSems sync.Map      // raftKey -> chan struct{}, see admissionSem
-	proposalStats proposalStats
-	stopOnce      sync.Once
-	stopBegun     atomic.Bool
+	proposalSeq        atomic.Uint64 // receipt identity, unique within the group
+	admissionSems      sync.Map      // raftKey -> chan struct{}, see admissionSem
+	proposalStats      proposalStats
+	storageDomainError error
+	started            atomic.Bool
+	stopOnce           sync.Once
+	stopBegun          atomic.Bool
 	// loopDone closes once the shutdown lifecycle joined the event loop,
 	// fenced pool submission and settled receipts.
 	loopDone       chan struct{}
@@ -69,6 +76,8 @@ type RaftGroup struct {
 func New(opts *Options) *RaftGroup {
 	rg := &RaftGroup{
 		raftList:           newLinkedList(),
+		storageLeases:      make(map[string]*raftLease),
+		storageOperations:  make(map[*storageOperation]struct{}),
 		stopper:            syncutil.NewStopper(),
 		opts:               opts,
 		advanceC:           make(chan struct{}, 1),
@@ -82,7 +91,11 @@ func New(opts *Options) *RaftGroup {
 		poolIdle:           make(chan struct{}),
 		loopDone:           make(chan struct{}),
 	}
-	rg.wait = newWait(rg.readLog)
+	storage := opts.Storage
+	if bs, ok := storage.(BoundStorage); ok {
+		rg.storageDomainError = bs.AttachStorageDomain(rg)
+	}
+	rg.wait = newWait(func(key string, index uint64) (types.Log, bool, error) { return readStorageLog(storage, key, index) })
 	var err error
 	rg.goPool, err = ants.NewPool(opts.GoPoolSize, ants.WithNonblocking(true), ants.WithPanicHandler(func(i interface{}) {
 		rg.Panic("raftgroup:go pool panic", zap.Any("panic", i), zap.Stack("stack"))
@@ -98,16 +111,67 @@ func (rg *RaftGroup) Options() *Options {
 	return rg.opts
 }
 
-func (rg *RaftGroup) AddRaft(r IRaft) {
+// AddRaft refuses replacement until accepted old storage effects and their
+// terminal dispositions have drained. Callers must retry with a freshly read
+// candidate after ErrRaftBusy; construction itself is not yet reserved here.
+func (rg *RaftGroup) AddRaft(r IRaft) error {
+	rg.ownerMu.Lock()
+	defer rg.ownerMu.Unlock()
+	return rg.addRaft(r)
+}
+
+// addRaft runs with ownerMu held.
+func (rg *RaftGroup) addRaft(r IRaft) error {
+	if bs, ok := rg.opts.Storage.(BoundStorage); ok {
+		if err := bs.ClaimStorageKey(rg, r.Key()); err != nil {
+			return err
+		}
+	}
+	rg.storageMu.Lock()
+	if rg.stopBegun.Load() {
+		rg.storageMu.Unlock()
+		return ErrGroupStopped
+	}
+	old := rg.storageLeases[r.Key()]
+	if old != nil && (!old.retired || old.pending != 0 || old.raft == r) {
+		rg.storageMu.Unlock()
+		return ErrRaftBusy
+	}
+	rg.wait.removeKey(r.Key(), proposalOutcomeUnknown(ErrRaftNotExist))
+	rg.storageLeases[r.Key()] = &raftLease{raft: r, storage: rg.opts.Storage}
 	rg.raftList.push(r)
+	rg.storageMu.Unlock()
 	if rg.opts.Event != nil {
 		rg.opts.Event.OnAddRaft(r)
 	}
+	return nil
 }
 
 func (rg *RaftGroup) RemoveRaft(r IRaft) {
+	// Fence admission immediately; AddRaft's owner serialization separately
+	// acknowledges detachment before any replacement can run.
+	rg.removeRaft(r)
+}
+
+// removeRaft fences the exact instance without waiting for its storage effects.
+func (rg *RaftGroup) removeRaft(r IRaft) {
+	rg.storageMu.Lock()
+	lease := rg.storageLeases[r.Key()]
+	if lease == nil || lease.retired || lease.raft != r {
+		rg.storageMu.Unlock()
+		return
+	}
+	lease.retired = true
+	// Key-wide receipt and admission cleanup still belongs to this instance.
+	// Keep replacement fenced until that cleanup and its callback return.
+	lease.pending++
 	rg.raftList.remove(r.Key())
-	// Nothing will apply or fence this raft's receipts any more.
+	rg.storageMu.Unlock()
+	defer func() {
+		rg.storageMu.Lock()
+		lease.pending--
+		rg.storageMu.Unlock()
+	}()
 	rg.wait.removeKey(r.Key(), proposalOutcomeUnknown(ErrRaftNotExist))
 	rg.admissionSems.Delete(r.Key())
 	if rg.opts.Event != nil {
@@ -137,6 +201,13 @@ func (rg *RaftGroup) IsLeader(raftKey string) bool {
 }
 
 func (rg *RaftGroup) Start() error {
+	if rg.storageDomainError != nil {
+		return rg.storageDomainError
+	}
+	if rg.stopBegun.Load() {
+		return ErrGroupStopped
+	}
+	rg.started.Store(true)
 	rg.stopper.RunWorker(rg.loopEvent)
 	return nil
 }
@@ -171,6 +242,7 @@ func (rg *RaftGroup) BeginStop() {
 			// next iteration.
 			rg.stopper.Stop()
 			rg.verificationMu.Lock()
+			rg.disposeStoppedStorage()
 			rg.loopJoined = true
 			if rg.poolTasks == 0 {
 				close(rg.poolIdle)
@@ -185,8 +257,12 @@ func (rg *RaftGroup) BeginStop() {
 }
 
 // readLog point-reads one stored log for receipt verification.
-func (rg *RaftGroup) readLog(raftKey string, index uint64) (types.Log, bool, error) {
-	logs, err := rg.opts.Storage.GetLogs(raftKey, index, index+1, 0)
+func readStorageLog(storage IStorage, raftKey string, index uint64) (types.Log, bool, error) {
+	var (
+		logs []types.Log
+		err  error
+	)
+	logs, err = storage.GetLogs(raftKey, index, index+1, 0)
 	if err != nil {
 		return types.Log{}, false, err
 	}
@@ -273,6 +349,7 @@ func (rg *RaftGroup) TryAddEvent(raftKey string, e types.Event) {
 
 func (rg *RaftGroup) loopEvent() {
 	tk := time.NewTicker(rg.opts.TickInterval)
+	defer tk.Stop()
 	for !rg.stopped {
 		if rg.stopBegun.Load() {
 			// Storage submission is fenced; do not step its refusals.
@@ -287,10 +364,15 @@ func (rg *RaftGroup) loopEvent() {
 			if err := req.ctx.Err(); err != nil {
 				req.result <- err
 			} else {
-				req.result <- req.fn(rg.GetRaft(req.key))
+				rg.ownerMu.Lock()
+				err := req.fn(rg.GetRaft(req.key))
+				rg.ownerMu.Unlock()
+				req.result <- err
 			}
 		case req := <-rg.readStateC:
+			rg.ownerMu.Lock()
 			rg.handleReadState(req)
+			rg.ownerMu.Unlock()
 		case <-rg.stopper.ShouldStop():
 			return
 		}
@@ -298,6 +380,8 @@ func (rg *RaftGroup) loopEvent() {
 }
 
 func (rg *RaftGroup) readyEvents() {
+	rg.ownerMu.Lock()
+	defer rg.ownerMu.Unlock()
 	hasEvent := false
 	// 处理收到的事件
 	has := rg.handleReceivedEvents()
@@ -327,6 +411,23 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 			continue // abandoned by its waiter after shutdown began
 		}
 		raft := rg.raftList.get(e.RaftKey)
+		if e.storageOperation != nil {
+			op := e.storageOperation
+			if !rg.currentStorageOperation(op, raft) {
+				// Accepted Apply remains truthful for its detached original
+				// instance. It cannot resolve replacement waiters.
+				if e.Type == types.ApplyResp {
+					_ = op.lease.raft.Step(e.Event)
+				}
+				rg.disposeStorageOperation(op)
+				continue
+			}
+		} else if localStorageResponse(e.Type) {
+			if e.WaitC != nil {
+				e.WaitC <- ErrUnauthenticatedStorageResult
+			}
+			continue
+		}
 		if e.Proposal != nil {
 			if raft == nil {
 				rg.Warn("raft not found", zap.String("raftKey", e.RaftKey), zap.String("event", e.Event.Type.String()))
@@ -351,6 +452,12 @@ func (rg *RaftGroup) handleReceivedEvents() bool {
 		}
 		hasEvent = true
 		err := raft.Step(e.Event)
+		if e.storageOperation != nil && e.Type == types.ApplyResp && e.Reason == types.ReasonOk && err == nil {
+			rg.wait.didApply(e.RaftKey, e.Index, e.Logs)
+		}
+		if e.storageOperation != nil {
+			rg.disposeStorageOperation(e.storageOperation)
+		}
 		if err != nil {
 			rg.Error("step failed", zap.Error(err), zap.String("handleKey", raft.Key()))
 		}
@@ -377,6 +484,8 @@ func (rg *RaftGroup) handleReadys() bool {
 }
 
 func (rg *RaftGroup) ticks() {
+	rg.ownerMu.Lock()
+	defer rg.ownerMu.Unlock()
 	rg.raftList.readHandlers(&rg.tmpRafts)
 	for _, r := range rg.tmpRafts {
 		r.Tick()

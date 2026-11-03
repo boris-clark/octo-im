@@ -32,7 +32,11 @@ type Server struct {
 	wake struct {
 		sync.RWMutex
 		channels map[string]bool
+		stopping bool
+		wg       sync.WaitGroup
 	}
+	wakeStop sync.Once
+	wakeDone chan struct{}
 
 	wakeLeaderLock *ringlock.RingLock
 }
@@ -42,6 +46,7 @@ func NewServer(opts *Options) *Server {
 		opts:           opts,
 		Log:            wklog.NewWKLog("channel.Server"),
 		wakeLeaderLock: ringlock.NewRingLock(1024),
+		wakeDone:       make(chan struct{}),
 	}
 	s.storage = newStorage(opts.DB, s)
 	for i := 0; i < opts.GroupCount; i++ {
@@ -76,6 +81,19 @@ func (s *Server) Start() error {
 // can touch the shared DB. The DB belongs to the caller: on error it must stay
 // open, and a later call awaits the same pending lifecycles.
 func (s *Server) StopWithContext(ctx context.Context) error {
+	// Reload hints may still be waiting on metadata RPCs. Close admission and
+	// collect them before returning ownership of their shared database.
+	s.wakeStop.Do(func() {
+		s.wake.Lock()
+		s.wake.stopping = true
+		s.wake.Unlock()
+		go func() { s.wake.wg.Wait(); close(s.wakeDone) }()
+	})
+	select {
+	case <-s.wakeDone:
+	case <-ctx.Done():
+		return fmt.Errorf("%w: channel metadata reload handoff: %w", raftgroup.ErrIncompleteQuiescence, ctx.Err())
+	}
 	for _, rg := range s.raftGroups {
 		rg.BeginStop()
 	}
@@ -156,15 +174,21 @@ func (s *Server) WakeFollowerfNeed(channelId string, channelType uint8) error {
 func (s *Server) wakeFollowerIfNeedAsync(channelId string, channelType uint8) {
 
 	s.wake.Lock()
+	if s.wake.stopping {
+		s.wake.Unlock()
+		return
+	}
 	channelKey := wkutil.ChannelToKey(channelId, channelType)
 	if ok := s.wake.channels[channelKey]; ok {
 		s.wake.Unlock()
 		return
 	}
 	s.wake.channels[channelKey] = true
+	s.wake.wg.Add(1)
 	s.wake.Unlock()
 
 	go func() {
+		defer s.wake.wg.Done()
 		err := s.WakeFollowerfNeed(channelId, channelType)
 		if err != nil {
 			s.Error("wake channel failed", zap.Error(err))

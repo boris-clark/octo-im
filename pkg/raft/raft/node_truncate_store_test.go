@@ -62,7 +62,7 @@ func TestFollowerTruncationWaitsForInFlightStore(t *testing.T) {
 				// as a faster storage task would.
 				require.NotPanics(t, func() {
 					n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonOk, Index: trunc.Index})
-					n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
+					completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
 				}, "late StoreResp after truncation")
 				t.Fatal("truncation was dispatched while a store was in flight")
 			}
@@ -71,7 +71,7 @@ func TestFollowerTruncationWaitsForInFlightStore(t *testing.T) {
 			require.False(t, ok, "no new store while the truncation is pending")
 
 			// The store lands; only now is the truncation dispatched.
-			n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
+			completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
 			trunc, ok := findEvent(collectEvents(n), types.TruncateReq)
 			require.True(t, ok, "deferred truncation is dispatched after the store")
 			require.EqualValues(t, 10, trunc.Index)
@@ -99,7 +99,7 @@ func TestFollowerDeferredTruncationAfterFailedStore(t *testing.T) {
 	n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonTruncate, Index: 10})
 	_, sent := findEvent(collectEvents(n), types.TruncateReq)
 	require.False(t, sent)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonError})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonError})
 	trunc, ok := findEvent(collectEvents(n), types.TruncateReq)
 	require.True(t, ok)
 	require.EqualValues(t, 10, trunc.Index)
@@ -130,7 +130,7 @@ func TestDeferredTruncationDroppedOnRoleChange(t *testing.T) {
 	n.BecomeFollower(2, 2)
 	require.False(t, n.truncating)
 	require.False(t, n.hasDeferredTruncate)
-	n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20})
+	completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20})
 	_, sent := findEvent(collectEvents(n), types.TruncateReq)
 	require.False(t, sent, "the dropped truncation is not dispatched later")
 
@@ -194,7 +194,7 @@ func TestDeferredTruncationDropsUnstoredTailBeyondStore(t *testing.T) {
 			n.Step(types.Event{Type: types.SyncResp, Term: 2, From: 2, Reason: types.ReasonTruncate, Index: 10})
 			_, sent := findEvent(collectEvents(n), types.TruncateReq)
 			require.False(t, sent, "deferred behind the in-flight store")
-			n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
+			completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 20, Logs: store.Logs})
 			trunc, ok := findEvent(collectEvents(n), types.TruncateReq)
 			require.True(t, ok)
 			n.Step(types.Event{Type: types.TruncateResp, Reason: types.ReasonOk, Index: trunc.Index})
@@ -212,7 +212,7 @@ func TestDeferredTruncationDropsUnstoredTailBeyondStore(t *testing.T) {
 				require.EqualValues(t, 2, l.Term, "only the new leader's entries are stored")
 			}
 			require.NotPanics(t, func() {
-				n.Step(types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 15, Logs: next.Logs})
+				completePendingStore(n, types.Event{Type: types.StoreResp, Reason: types.ReasonOk, Index: 15, Logs: next.Logs})
 			})
 			require.EqualValues(t, 15, n.queue.storedIndex)
 			require.EqualValues(t, 15, n.queue.lastLogIndex)

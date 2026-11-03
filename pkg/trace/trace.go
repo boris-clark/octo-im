@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkhttp"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
@@ -10,10 +11,27 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
+// GlobalTrace is retained for serialized legacy save/restore callers.
+// Deprecated: concurrent readers must use GetGlobalTrace; publish only with
+// SetGlobalTrace. Metrics must be fully initialized before publication.
 var GlobalTrace *Trace
 
+var globalTraceMu sync.RWMutex
+
 func SetGlobalTrace(t *Trace) {
+	globalTraceMu.Lock()
+	defer globalTraceMu.Unlock()
 	GlobalTrace = t
+}
+
+// GetGlobalTrace returns a safely published reference. Keep it for the whole
+// operation so replacement cannot mix metrics or invalidate a nil check.
+// Replacement does not stop the previous trace; its owner must finish its
+// consumers before calling Stop.
+func GetGlobalTrace() *Trace {
+	globalTraceMu.RLock()
+	defer globalTraceMu.RUnlock()
+	return GlobalTrace
 }
 
 var (

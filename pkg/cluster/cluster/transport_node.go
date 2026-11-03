@@ -21,6 +21,8 @@ func newNodeTransport(s *Server) *nodeTransport {
 }
 
 func (n *nodeTransport) Send(event types.Event) {
+	currentTrace := trace.GetGlobalTrace()
+
 	to := event.To
 	if to == 0 {
 		n.Error("Send event to node id is 0", zap.Uint64("to", to), zap.String("event", event.String()))
@@ -43,13 +45,13 @@ func (n *nodeTransport) Send(event types.Event) {
 		MsgType: MsgTypeNode,
 		Content: data,
 	}
-	if trace.GlobalTrace != nil {
+	if currentTrace != nil {
 		if event.Type == types.SyncReq {
-			trace.GlobalTrace.Metrics.Cluster().MsgSyncOutgoingCountAdd(trace.ClusterKindConfig, 1)
-			trace.GlobalTrace.Metrics.Cluster().MsgSyncOutgoingBytesAdd(trace.ClusterKindConfig, int64(msg.Size()))
+			currentTrace.Metrics.Cluster().MsgSyncOutgoingCountAdd(trace.ClusterKindConfig, 1)
+			currentTrace.Metrics.Cluster().MsgSyncOutgoingBytesAdd(trace.ClusterKindConfig, int64(msg.Size()))
 		}
-		trace.GlobalTrace.Metrics.Cluster().MessageOutgoingCountAdd(trace.ClusterKindConfig, 1)
-		trace.GlobalTrace.Metrics.Cluster().MessageOutgoingBytesAdd(trace.ClusterKindConfig, int64(msg.Size()))
+		currentTrace.Metrics.Cluster().MessageOutgoingCountAdd(trace.ClusterKindConfig, 1)
+		currentTrace.Metrics.Cluster().MessageOutgoingBytesAdd(trace.ClusterKindConfig, int64(msg.Size()))
 	}
 
 	err = node.SendWithPriority(msg, isHighPriority(event))

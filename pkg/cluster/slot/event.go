@@ -1,9 +1,14 @@
 package slot
 
 import (
+	"context"
+	"time"
+
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"go.uber.org/zap"
 )
 
 // 配置发送改变
@@ -39,20 +44,30 @@ func (s *Server) AddOrUpdateSlotRaft(slot *types.Slot) {
 	}
 
 	if rft == nil { // 添加slot的raft
-		slotNode := newSlot(slot, s)
-		s.raftGroup.AddRaft(slotNode)
-
-		s.raftGroup.AddEvent(shardNo, rafttype.Event{
-			Type:   rafttype.ConfChange,
-			Config: s.slotToConfig(slot),
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := s.raftGroup.InitializeRaftWithStorage(ctx, shardNo, func(binding *raftgroup.StorageBinding) (raftgroup.IRaft, error) {
+			return newSlot(slot, s, binding)
+		}, func(candidate raftgroup.IRaft) error {
+			st := candidate.(*Slot)
+			cfg := s.slotToConfig(slot)
+			if st.PendingElectionFence() && cfg.Term < st.Config().Term {
+				return st.RestoreElectionFence(cfg)
+			}
+			return candidate.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg})
 		})
+		if err != nil {
+			s.Error("initialize slot failed", zap.Uint32("slotId", slot.Id), zap.Error(err))
+		}
 	} else { // 更新slot的分布式配置
 		raftSlot := rft.(*Slot)
 		if raftSlot.needUpdate(slot) {
+			raftSlot.slot = slot.Clone()
 			s.raftGroup.AddEvent(shardNo, rafttype.Event{
 				Type:   rafttype.ConfChange,
 				Config: s.slotToConfig(slot),
 			})
+			s.raftGroup.Advance()
 		}
 	}
 }
@@ -73,6 +88,7 @@ func (s *Server) slotToConfig(st *types.Slot) rafttype.Config {
 	}
 
 	cfg := rafttype.Config{
+		InstalledTerm: st.InstalledTerm, BoundaryTerm: st.BoundaryTerm, FenceEnabled: st.InstalledTerm != 0,
 		MigrateFrom: st.MigrateFrom,
 		MigrateTo:   st.MigrateTo,
 		Replicas:    st.Replicas,

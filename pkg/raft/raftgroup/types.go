@@ -7,7 +7,8 @@ import (
 )
 
 type Event struct {
-	RaftKey string
+	storageOperation *storageOperation
+	RaftKey          string
 	types.Event
 	WaitC chan error
 	// claim, set with WaitC, is won either by the event loop before it

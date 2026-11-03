@@ -9,13 +9,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/cockroachdb/pebble"
 	"go.uber.org/zap"
 )
 
 func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []Message) error {
+	return wk.AppendMessagesWithTerm(channelId, channelType, msgs, nil)
+}
+
+// AppendMessagesWithTerm syncs message rows, client indexes, tail and the supplied
+// term boundary in one message-shard batch, after adopting legacy metadata.
+func (wk *wukongDB) AppendMessagesWithTerm(channelId string, channelType uint8, msgs []Message, term *types.TermStartIndexInfo) error {
+	lock := wk.raftLock(wkutil.ChannelToKey(channelId, channelType))
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.AppendMessagesAdd(1)
 
@@ -29,6 +40,59 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}()
 	}
 
+	if len(msgs) == 0 {
+		return nil
+	}
+	hard, err := wk.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return err
+	}
+	applied, err := wk.GetChannelAppliedIndex(channelId, channelType)
+	if err != nil {
+		return err
+	}
+	protected := max(applied, hard.CommittedFloor)
+	first, last := uint64(msgs[0].MessageSeq), uint64(msgs[0].MessageSeq)
+	for _, msg := range msgs {
+		first = min(first, uint64(msg.MessageSeq))
+		last = max(last, uint64(msg.MessageSeq))
+	}
+	wk.logMetadataMu.Lock()
+	defer wk.logMetadataMu.Unlock()
+	db, canonical, err := wk.channelLogDBLocked(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return err
+	}
+	barriers, err := channelNoops(db, wkutil.ChannelToKey(channelId, channelType), first, last+1)
+	if err != nil {
+		return err
+	}
+	barrierIndexes := make(map[uint64]bool, len(barriers))
+	for _, barrier := range barriers {
+		barrierIndexes[barrier.Index] = true
+	}
+	for _, msg := range msgs {
+		if barrierIndexes[uint64(msg.MessageSeq)] {
+			return fmt.Errorf("%w: message would replace a replication barrier", types.ErrAppendBelowApplied)
+		}
+		if uint64(msg.MessageSeq) <= protected {
+			stored, err := wk.LoadMsg(channelId, channelType, uint64(msg.MessageSeq))
+			if err != nil {
+				return err
+			}
+			a, err := EncodeChannelLogData(&stored)
+			if err != nil {
+				return err
+			}
+			b, err := EncodeChannelLogData(&msg)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(a, b) {
+				return fmt.Errorf("%w: channel index %d protected %d", types.ErrAppendBelowApplied, msg.MessageSeq, protected)
+			}
+		}
+	}
 	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
 	for _, msg := range msgs {
 		if err := wk.writeMessage(channelId, channelType, msg, batch); err != nil {
@@ -36,8 +100,23 @@ func (wk *wukongDB) AppendMessages(channelId string, channelType uint8, msgs []M
 		}
 
 	}
+	if term != nil {
+		matched := false
+		for _, msg := range msgs {
+			if uint64(msg.MessageSeq) == term.Index && msg.Term == uint64(term.Term) {
+				matched = true
+				break
+			}
+		}
+		if !matched || term.Term == 0 {
+			return fmt.Errorf("term boundary is outside message batch")
+		}
+		value := make([]byte, 8)
+		wk.endian.PutUint64(value, term.Index)
+		batch.Set(termKey(wkutil.ChannelToKey(channelId, channelType), term.Term, canonical), value)
+	}
 	lastMsg := msgs[len(msgs)-1]
-	err := wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
+	err = wk.setChannelLastMessageSeq(channelId, channelType, uint64(lastMsg.MessageSeq), batch)
 	if err != nil {
 		return err
 	}
@@ -485,6 +564,9 @@ func (wk *wukongDB) LoadNextRangeMsgsForSize(channelId string, channelType uint8
 }
 
 func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSeq uint64) error {
+	lock := wk.raftLock(wkutil.ChannelToKey(channelId, channelType))
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.TruncateLogToAdd(1)
 
@@ -497,8 +579,9 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	if err != nil {
 		return err
 	}
-	if messageSeq < applied {
-		return fmt.Errorf("cannot truncate applied channel log: target=%d applied=%d", messageSeq, applied)
+	hard, err := wk.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return err
 	}
 
 	// 获取最新的消息seq
@@ -508,8 +591,28 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 		return err
 	}
 
-	if messageSeq >= lastMsgSeq {
+	shardNo := wkutil.ChannelToKey(channelId, channelType)
+	wk.logMetadataMu.Lock()
+	defer wk.logMetadataMu.Unlock()
+	logDB, canonical, err := wk.channelLogDBLocked(shardNo)
+	if err != nil {
+		return err
+	}
+	barrier, err := lastChannelNoop(logDB, shardNo)
+	if err != nil {
+		return err
+	}
+	// Reconciliation can request the already-retained tail after a fence.
+	// It removes no history and must not quarantine an otherwise valid replica.
+	if messageSeq >= max(lastMsgSeq, barrier.Index) && messageSeq >= max(applied, hard.CommittedFloor) {
 		return nil
+	}
+	if messageSeq < max(applied, hard.CommittedFloor) || hard.BoundaryTerm != 0 {
+		hard.Quarantined = true
+		if err := wk.shardDB(wkutil.ChannelToKey(channelId, channelType)).Set(key.NewRaftHardStateKey(wkutil.ChannelToKey(channelId, channelType)), hard.Marshal(), pebble.Sync); err != nil {
+			return fmt.Errorf("%w: %v", types.ErrTruncateBelowApplied, err)
+		}
+		return fmt.Errorf("%w: channel target=%d protected=%d", types.ErrTruncateBelowApplied, messageSeq, max(applied, hard.CommittedFloor))
 	}
 
 	wk.Warn("truncateLogTo message", zap.Uint64("messageSeq", messageSeq), zap.Uint64("lastMsgSeq", lastMsgSeq), zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Uint64("messageSeq", messageSeq))
@@ -523,9 +626,49 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 
 	db := wk.channelBatchDb(channelId, channelType)
 	batch := db.NewBatch()
+	removed, err := wk.LoadNextRangeMsgs(channelId, channelType, messageSeq+1, 0, 0)
+	if err != nil {
+		return err
+	}
+	for _, msg := range removed {
+		wk.deleteMessageIndexes(channelId, channelType, msg, batch)
+	}
 	batch.DeleteRange(key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1), key.NewMessagePrimaryKey(channelId, channelType, math.MaxUint64))
+	batch.DeleteRange(key.NewChannelNoopKey(shardNo, messageSeq+1), key.NewChannelNoopKey(shardNo, math.MaxUint64))
+	low, high := termBounds(shardNo, canonical)
+	iter := logDB.NewIter(&pebble.IterOptions{LowerBound: low, UpperBound: high})
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if len(iter.Value()) != 8 {
+			return fmt.Errorf("invalid channel term row")
+		}
+		if wk.endian.Uint64(iter.Value()) > messageSeq {
+			batch.Delete(bytes.Clone(iter.Key()))
+		}
+	}
+	if err = iter.Error(); err != nil {
+		return err
+	}
 
-	err = wk.setChannelLastMessageSeq(channelId, channelType, messageSeq, batch)
+	// Message scans retain their own tail; a barrier has no message row.
+	messageTail := uint64(0)
+	messageIter := wk.channelDb(channelId, channelType).NewIter(&pebble.IterOptions{
+		LowerBound: key.NewMessagePrimaryKey(channelId, channelType, 0),
+		UpperBound: key.NewMessagePrimaryKey(channelId, channelType, messageSeq+1),
+	})
+	if messageIter.Last() {
+		messageTail, _, err = key.ParseMessageColumnKey(messageIter.Key())
+	}
+	if err == nil {
+		err = messageIter.Error()
+	}
+	if closeErr := messageIter.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	err = wk.setChannelLastMessageSeq(channelId, channelType, messageTail, batch)
 	if err != nil {
 		return err
 	}
@@ -536,9 +679,10 @@ func (wk *wukongDB) TruncateLogTo(channelId string, channelType uint8, messageSe
 	}
 
 	wk.channelSeqCache.invalidateChannelLastSeq(channelId, channelType)
-
+	for _, msg := range removed {
+		wk.userLastMsgSeqCache.invalidate(msg.FromUID, channelId, channelType)
+	}
 	return nil
-
 }
 
 func (wk *wukongDB) GetChannelLastMessageSeq(channelId string, channelType uint8) (uint64, uint64, error) {
@@ -1529,4 +1673,15 @@ func (wk *wukongDB) writeMessage(channelId string, channelType uint8, msg Messag
 	w.Set(key.NewMessageIndexTimestampKey(uint64(msg.Timestamp), primaryValue), nil)
 
 	return nil
+}
+
+// deleteMessageIndexes removes only indexes belonging to the discarded suffix.
+func (wk *wukongDB) deleteMessageIndexes(channelId string, channelType uint8, msg Message, batch *Batch) {
+	var primary [16]byte
+	wk.endian.PutUint64(primary[:8], key.ChannelToNum(channelId, channelType))
+	wk.endian.PutUint64(primary[8:], uint64(msg.MessageSeq))
+	batch.Delete(key.NewMessageSecondIndexFromUidKey(msg.FromUID, primary))
+	batch.Delete(key.NewMessageIndexMessageIdKey(uint64(msg.MessageID)))
+	batch.Delete(key.NewMessageSecondIndexClientMsgNoKey(msg.ClientMsgNo, primary))
+	batch.Delete(key.NewMessageIndexTimestampKey(uint64(msg.Timestamp), primary))
 }

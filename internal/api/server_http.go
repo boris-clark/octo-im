@@ -201,6 +201,7 @@ func (s *apiServer) jwtAndTokenAuthSetMiddleware() wkhttp.HandlerFunc {
 func bandwidthMiddleware() wkhttp.HandlerFunc {
 
 	return func(c *wkhttp.Context) {
+		currentTrace := trace.GetGlobalTrace()
 
 		// fpath := c.FullPath()
 		// if strings.HasPrefix(fpath, "/metrics") { // 监控不计算外网带宽
@@ -209,13 +210,13 @@ func bandwidthMiddleware() wkhttp.HandlerFunc {
 		// }
 		// 获取请求大小
 		requestSize := computeRequestSize(c.Request)
-		trace.GlobalTrace.Metrics.System().ExtranetIncomingAdd(int64(requestSize))
+		currentTrace.Metrics.System().ExtranetIncomingAdd(int64(requestSize))
 
 		// 获取响应大小
 		blw := &bodyLogWriter{ResponseWriter: c.Writer}
 		c.Writer = blw
 		c.Next()
-		trace.GlobalTrace.Metrics.System().ExtranetOutgoingAdd(int64(blw.size))
+		currentTrace.Metrics.System().ExtranetOutgoingAdd(int64(blw.size))
 
 	}
 }

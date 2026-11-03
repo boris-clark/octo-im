@@ -60,11 +60,12 @@ func driveCluster(nodes map[uint64]*Node) bool {
 				switch e.Type {
 				case types.StoreReq:
 					lastIdx := e.Logs[len(e.Logs)-1].Index
-					sourceNode.Step(types.Event{
+					sourceNode.Step(types.StoreResponse(e, types.Event{
+						Logs:   e.Logs,
 						Type:   types.StoreResp,
 						Index:  lastIdx,
 						Reason: types.ReasonOk,
-					})
+					}))
 				case types.ApplyReq:
 					sourceNode.Step(types.Event{
 						Type:   types.ApplyResp,

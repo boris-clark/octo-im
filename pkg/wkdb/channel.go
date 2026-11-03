@@ -486,6 +486,9 @@ func (wk *wukongDB) DeleteChannel(channelId string, channelType uint8) error {
 }
 
 func (wk *wukongDB) UpdateChannelAppliedIndex(channelId string, channelType uint8, index uint64) error {
+	lock := wk.raftLock(wkutil.ChannelToKey(channelId, channelType))
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.UpdateChannelAppliedIndexAdd(1)
 

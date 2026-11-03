@@ -58,6 +58,9 @@ func (s *Slot) Unmarshal(data []byte) error {
 // }
 
 func (s *Slot) Equal(v *Slot) bool {
+	if s.InstalledTerm != v.InstalledTerm || s.BoundaryTerm != v.BoundaryTerm {
+		return false
+	}
 	if s.Id != v.Id {
 		return false
 	}

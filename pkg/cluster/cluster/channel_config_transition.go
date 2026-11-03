@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
@@ -12,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 const channelConfigTransitionPath = "/rpc/channel/configTransition/v1"
@@ -65,6 +67,11 @@ func (s *Server) saveChannelConfigTransition(ctx context.Context, id string, typ
 }
 
 func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string, typ uint8, next rafttype.Config) (wkdb.ChannelClusterConfig, error) {
+	key := wkutil.ChannelToKey(id, typ)
+	if err := s.channelInstallLock.LockContext(ctx, key); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
+	defer s.channelInstallLock.Unlock(key)
 	current, err := s.loadConversationConfigLocal(ctx, id, typ)
 	if err != nil {
 		return current, err
@@ -72,16 +79,27 @@ func (s *Server) saveChannelConfigTransitionLocal(ctx context.Context, id string
 	if next.Version != current.ConfVersion || next.Term < current.Term {
 		return current, raft.ErrConfigVersionStale
 	}
-	s.updateChannelCfgByConfig(&current, next)
+	if next.Term > current.Term && slices.Contains(current.Replicas, next.Leader) && !slices.Contains(current.Learners, next.Leader) &&
+		slices.Equal(next.Replicas, current.Replicas) && slices.Equal(next.Learners, current.Learners) &&
+		next.MigrateFrom == current.MigrateFrom && next.MigrateTo == current.MigrateTo {
+		// Recovery asks for a fresh term, not preferential treatment for the
+		// old leader. The durable quorum may identify a fresher surviving voter.
+		if _, err := s.fenceChannelConfig(ctx, &current, next.Term); err != nil {
+			return current, err
+		}
+	} else {
+		s.updateChannelCfgByConfig(&current, next)
+	}
 	if !validConversationConfig(current, id, typ) {
 		return current, ErrConversationReadRetry
 	}
-	version, err := s.saveChannelConfig(ctx, current)
+	_, err = s.saveChannelConfigLocked(ctx, current)
 	if err != nil {
 		return current, err
 	}
-	current.ConfVersion = version
-	return current, nil
+	// Return the applied certificate, including markers assigned by the
+	// authority, rather than grafting a new version onto the callback snapshot.
+	return s.loadConversationConfigLocal(ctx, id, typ)
 }
 
 func (r *rpcServer) handleChannelConfigTransition(c *wkserver.Context) {
@@ -109,6 +127,25 @@ func (r *rpcServer) handleChannelConfigTransition(c *wkserver.Context) {
 // vote in it) with a new authority-issued term. Reads keep their exact fence.
 // A racing metadata transition wins at admission and is reloaded on retry.
 func (s *Server) reconcileLocalChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) (bool, error) {
+	// Read durable recovery state even when no channel runtime exists. A
+	// normal dormant row is otherwise intentionally left asleep below.
+	info, err := s.getChannelLastLogInfo(ctx, cfg.ChannelId, cfg.ChannelType)
+	if err != nil {
+		return false, err
+	}
+	if info.Term > cfg.Term {
+		if info.Term == math.MaxUint32 {
+			return false, ErrConversationReadRetry
+		}
+		_, err = s.saveChannelConfigTransition(ctx, cfg.ChannelId, cfg.ChannelType, rafttype.Config{
+			Version: cfg.ConfVersion, Term: info.Term + 1, Leader: cfg.LeaderId,
+			Replicas: cfg.Replicas, Learners: cfg.Learners, MigrateFrom: cfg.MigrateFrom, MigrateTo: cfg.MigrateTo,
+		})
+		if err != nil {
+			return false, err
+		}
+		return false, ErrConversationReadRetry
+	}
 	dormant, applyErr := s.channelServer.ReconcileConfig(ctx, cfg)
 	state, err := s.channelServer.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
 	if err != nil {

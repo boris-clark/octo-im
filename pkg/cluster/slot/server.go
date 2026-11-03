@@ -166,18 +166,45 @@ func (s *Server) getSlotId(v string) uint32 {
 	return wkutil.GetSlotNum(int(slotCount), v)
 }
 
+func (s *Server) withActiveSlotStorage(slotId uint32, fn func(shardNo string) error) error {
+	if s == nil || s.storage == nil || s.raftGroup == nil {
+		return ErrStorageUnbound
+	}
+	key := SlotIdToKey(slotId)
+	binding := s.raftGroup.StorageBinding(s.raftGroup.GetRaft(key))
+	return binding.WithStorage(func(call *raftgroup.StorageCall) error {
+		return s.storage.BindStorage(call).(*storageView).with(key, func() error { return fn(key) })
+	})
+}
+
 func (s *Server) AppliedIndex(slotId uint32) (uint64, error) {
-	shardNo := SlotIdToKey(slotId)
-	return s.storage.AppliedIndex(shardNo)
+	var idx uint64
+	err := s.withActiveSlotStorage(slotId, func(shardNo string) error {
+		var err error
+		idx, err = s.storage.appliedIndex(shardNo)
+		return err
+	})
+	return idx, err
 }
 
 func (s *Server) LastIndex(slotId uint32) (uint64, error) {
-	shardNo := SlotIdToKey(slotId)
-	return s.storage.LastIndex(shardNo)
+	var idx uint64
+	err := s.withActiveSlotStorage(slotId, func(shardNo string) error {
+		var err error
+		idx, err = s.storage.lastIndex(shardNo)
+		return err
+	})
+	return idx, err
 }
 
 func (s *Server) LastLog(slotId uint32) (types.Log, error) {
-	return s.storage.LastLog(SlotIdToKey(slotId))
+	var lg types.Log
+	err := s.withActiveSlotStorage(slotId, func(shardNo string) error {
+		var err error
+		lg, err = s.storage.lastLog(shardNo)
+		return err
+	})
+	return lg, err
 }
 
 func (s *Server) GetSlotRaft(slotId uint32) *Slot {
@@ -189,6 +216,11 @@ func (s *Server) GetSlotRaft(slotId uint32) *Slot {
 }
 
 func (s *Server) GetLogsInReverseOrder(slotId uint32, startLogIndex uint64, endLogIndex uint64, limit int) ([]types.Log, error) {
-	shardNo := SlotIdToKey(slotId)
-	return s.storage.GetLogsInReverseOrder(shardNo, startLogIndex, endLogIndex, limit)
+	var logs []types.Log
+	err := s.withActiveSlotStorage(slotId, func(shardNo string) error {
+		var err error
+		logs, err = s.storage.getLogsInReverseOrder(shardNo, startLogIndex, endLogIndex, limit)
+		return err
+	})
+	return logs, err
 }

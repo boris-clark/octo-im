@@ -185,6 +185,10 @@ func (s *Server) quarantine(slotId uint32, to ReplicaState, cause error) {
 // fail-stopped instead and the error is returned. The process keeps running
 // for every other slot.
 func (p *PebbleShardLogStorage) MarkDiverged(shardNo string, cause error) error {
+	return ErrStorageUnbound
+}
+
+func (p *PebbleShardLogStorage) markDiverged(shardNo string, cause error) error {
 	slotId := KeyToSlotId(shardNo)
 	if p.s != nil {
 		p.s.quarantine(slotId, ReplicaQuarantined, cause)
@@ -224,6 +228,10 @@ func (p *PebbleShardLogStorage) setDivergedMarker(shardNo string, value []byte) 
 
 // DivergedMarker reports whether the durable divergence marker is set.
 func (p *PebbleShardLogStorage) DivergedMarker(shardNo string) (bool, error) {
+	return false, ErrStorageUnbound
+}
+
+func (p *PebbleShardLogStorage) divergedMarker(shardNo string) (bool, error) {
 	return divergedMarker(p.shardDB(shardNo), shardNo)
 }
 

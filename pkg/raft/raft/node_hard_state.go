@@ -10,9 +10,30 @@ func (n *Node) setTerm(term uint32) {
 }
 
 func (n *Node) hardState() types.HardState {
-	return types.HardState{Term: n.cfg.Term, Vote: n.voteFor}
+	state := n.safetyState
+	state.Term, state.Vote = n.cfg.Term, n.voteFor
+	return state
 }
 
 func (n *Node) hasUnpersistedHardState() bool {
 	return n.opts.SaveHardState != nil && n.hardState() != n.persistedHardState
+}
+
+// persistCommit publishes no commit until the authenticated owner transition is durable.
+func (n *Node) persistCommit(index uint64) bool {
+	if index <= n.queue.committedIndex {
+		return true
+	}
+	n.pendingCommit = max(n.pendingCommit, index)
+	state := n.hardState()
+	state.CommittedFloor = max(state.CommittedFloor, index)
+	if n.opts.SaveHardState != nil {
+		if err := n.opts.SaveHardState(state); err != nil {
+			return false
+		}
+		n.persistedHardState = state
+	}
+	n.safetyState = state
+	n.pendingCommit = 0
+	return true
 }

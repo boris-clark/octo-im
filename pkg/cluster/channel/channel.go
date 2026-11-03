@@ -25,6 +25,20 @@ type Channel struct {
 	channelKey string
 	// Owned by rg.Do; retained if the caller expires between Step and Ready.
 	needsConfigResume bool
+	// Recovery admission survives caller cancellation until its real apply.
+	configResumeIndex uint64
+}
+
+// Step treats a newer peer configuration as a reload hint. Only metadata read
+// from the slot authority may install the new leader; the peer event itself
+// remains subject to the node's persisted election fence.
+func (ch *Channel) Step(e types.Event) error {
+	if ch.s.opts.Cluster != nil && (e.Type == types.Ping || e.Type == types.NotifySync) &&
+		(e.ConfigVersion > ch.Config().Version || e.Term > ch.Config().Term || ch.PendingElectionFence()) {
+		id, typ := wkutil.ChannelFromlKey(ch.channelKey)
+		ch.s.wakeFollowerIfNeedAsync(id, typ)
+	}
+	return ch.Node.Step(e)
 }
 
 func createChannel(cfg wkdb.ChannelClusterConfig, s *Server, rg *raftgroup.RaftGroup) (*Channel, error) {
@@ -92,12 +106,21 @@ func (ch *Channel) applyConfig(ctx context.Context, cfg rafttype.Config) error {
 // will subsequently run its Step/Tick/Ready calls. No storage or network I/O.
 func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 	current := ch.Config()
+	if ch.PendingElectionFence() && cfg.Term < current.Term {
+		return ch.RestoreElectionFence(cfg)
+	}
 	if cfg.Version < current.Version {
 		return fmt.Errorf("%w: incoming=%d runtime=%d", raft.ErrConfigVersionStale, cfg.Version, current.Version)
 	}
 	// Match Raft's normalization before the idempotency comparison. Restored
 	// hard state can exceed metadata; the slot owner repairs that metadata later.
-	cfg.Term = max(cfg.Term, current.Term)
+	if current.FenceEnabled || cfg.InstalledTerm != 0 {
+		if cfg.Term < current.Term {
+			return raft.ErrElectionNotInstalled
+		}
+	} else {
+		cfg.Term = max(cfg.Term, current.Term)
+	}
 	if !slices.Contains(cfg.Replicas, ch.s.opts.NodeId) {
 		cfg.Role = rafttype.RoleLearner
 		if cfg.Leader == ch.s.opts.NodeId {
@@ -119,7 +142,7 @@ func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 
 func (ch *Channel) resumeConfig(ctx context.Context) error {
 	// Keep this owner hop after ConfChange: Ready must persist a newly
-	// selected term before ResumeReplication can certify the stored tail.
+	// selected term before admitting a current-term recovery barrier.
 	// Retry outside the owner so Ready can retry a transient hard-state write.
 	// Foreground sends/config callbacks must not receive a terminal error for
 	// the first not-ready observation after their config has already applied.
@@ -130,13 +153,33 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 			if r != ch {
 				return raftgroup.ErrRaftNotExist
 			}
-			if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+			if ch.needsConfigResume && ch.IsLeader() {
 				if !ch.LeaderReadReady() {
 					return ErrConfigNotReady
 				}
-				ch.ResumeReplication()
+				// An ordinary already-committed apply may itself call applyConfig;
+				// only wait here for recovery that this config actually admitted.
+				singleVoter := len(ch.Config().Replicas) == 1
+				appliedOnlyTail := ch.AppliedIndex() > ch.CommittedIndex() && ch.LastLogIndex() <= ch.AppliedIndex()
+				oldTermTail := ch.LastLogIndex() > ch.CommittedIndex() && ch.LastLogTerm() < ch.Config().Term
+				if singleVoter && ch.LastLogIndex() > ch.CommittedIndex() || oldTermTail || appliedOnlyTail || ch.configResumeIndex > 0 {
+					index, err := ch.ResumeReplicationWithEntry(types.Log{Data: types.NoopData()})
+					if err != nil {
+						return err
+					}
+					ch.configResumeIndex = max(ch.configResumeIndex, index)
+					if ch.CommittedIndex() < ch.configResumeIndex || ch.AppliedIndex() < ch.configResumeIndex {
+						// Other voters must be able to initialize before a quorum
+						// exists. Retain the target; foreground sends still wait.
+						if !singleVoter {
+							return nil
+						}
+						return ErrConfigNotReady
+					}
+				}
 			}
 			ch.needsConfigResume = false
+			ch.configResumeIndex = 0
 			return nil
 		})
 		if !errors.Is(err, ErrConfigNotReady) {
@@ -151,7 +194,7 @@ func (ch *Channel) resumeConfig(ctx context.Context) error {
 }
 
 func sameChannelConfig(a, b rafttype.Config) bool {
-	return a.Version == b.Version && a.Term == b.Term && a.Leader == b.Leader && a.Role == b.Role &&
+	return a.InstalledTerm == b.InstalledTerm && a.BoundaryTerm == b.BoundaryTerm && a.FenceEnabled == b.FenceEnabled && a.Version == b.Version && a.Term == b.Term && a.Leader == b.Leader && a.Role == b.Role &&
 		a.MigrateFrom == b.MigrateFrom && a.MigrateTo == b.MigrateTo &&
 		slices.Equal(a.Replicas, b.Replicas) && slices.Equal(a.Learners, b.Learners)
 }
@@ -170,6 +213,7 @@ func channelConfigToRaftConfig(currentNodeId uint64, cfg wkdb.ChannelClusterConf
 	}
 
 	return types.Config{
+		InstalledTerm: cfg.InstalledTerm, BoundaryTerm: cfg.BoundaryTerm, FenceEnabled: cfg.InstalledTerm != 0,
 		MigrateFrom: cfg.MigrateFrom,
 		MigrateTo:   cfg.MigrateTo,
 		Replicas:    cfg.Replicas,
