@@ -126,6 +126,30 @@ func (b *tagBlucket) getTag(tagKey string) *types.Tag {
 	return b.tag.m[tagKey]
 }
 
+func (b *tagBlucket) getAndTouchTag(tagKey string, currentNodeVersion uint64) (*types.Tag, uint64, bool) {
+	b.tag.Lock()
+	defer b.tag.Unlock()
+	tag := b.tag.m[tagKey]
+	if tag == nil {
+		return nil, 0, false
+	}
+	if tag.NodeVersion < currentNodeVersion {
+		return nil, tag.NodeVersion, true
+	}
+	tag.LastGetTime = time.Now()
+	tag.GetCount.Inc()
+	return tag, tag.NodeVersion, false
+}
+
+func (b *tagBlucket) bindTagChannel(tagKey string, channelId string, channelType uint8) {
+	b.tag.Lock()
+	defer b.tag.Unlock()
+	if tag := b.tag.m[tagKey]; tag != nil {
+		tag.ChannelId = channelId
+		tag.ChannelType = channelType
+	}
+}
+
 func (b *tagBlucket) removeTag(tagKey string) {
 	b.tag.Lock()
 	defer b.tag.Unlock()
