@@ -26,7 +26,16 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 	}
 
 	// ========== 存储消息 ==========
-	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
+	unpersistedEvents := make([]*eventbus.Event, 0, len(events))
+	alreadyPersisted := false
+	for _, e := range events {
+		if e != nil && e.MessageSeq > 0 && e.ReasonCode == wkproto.ReasonSuccess {
+			alreadyPersisted = true
+			continue
+		}
+		unpersistedEvents = append(unpersistedEvents, e)
+	}
+	persists := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, unpersistedEvents)
 	if len(persists) > 0 {
 
 		timeoutCtx, cancel := h.WithTimeout()
@@ -34,20 +43,20 @@ func (h *Handler) persist(ctx *eventbus.ChannelContext) {
 		results, err := service.Store.AppendMessages(timeoutCtx, ctx.ChannelId, ctx.ChannelType, persists)
 		if err != nil {
 			h.Error("store message failed", zap.Error(err), zap.Int("events", len(persists)), zap.String("fakeChannelId", ctx.ChannelId), zap.Uint8("channelType", ctx.ChannelType))
-			markPersistFailure(events, err)
+			markPersistFailure(unpersistedEvents, err)
 		}
 
 		if err == nil {
-			err = applyPersistResults(events, persists, results)
+			err = applyPersistResults(unpersistedEvents, persists, results)
 			if err != nil {
 				h.Error("invalid persistence response", zap.Error(err))
-				markPersistFailure(events, err)
+				markPersistFailure(unpersistedEvents, err)
 			}
 		}
-		if err == nil {
-			h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, persists))
-		}
-
+	}
+	if len(persists) > 0 || alreadyPersisted {
+		allPersisted := h.toPersistMessages(ctx.ChannelId, ctx.ChannelType, events)
+		h.pluginInvokePersistAfter(ctx.ChannelId, ctx.ChannelType, newlyPersistedMessages(events, allPersisted))
 	}
 
 	if options.G.Logger.TraceOn {

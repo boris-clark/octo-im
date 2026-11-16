@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -21,7 +22,8 @@ import (
 
 type Server struct {
 	opts     *Options
-	raft     *raft.Raft             // raft算法
+	raft     *raft.Raft // raft算法
+	raftMu   sync.RWMutex
 	config   *Config                // 分布式配置对象
 	storage  *PebbleShardLogStorage // 配置日志存储
 	cfgGenId *snowflake.Node        // 配置ID生成器
@@ -88,6 +90,26 @@ func (s *Server) Options() *Options {
 	return s.opts
 }
 
+func (s *Server) CheckWriteHealth() error {
+	if s == nil {
+		return errors.New("clusterconfig server is nil")
+	}
+	if s.opts != nil && strings.TrimSpace(s.opts.ConfigPath) != "" {
+		cfgDir := path.Dir(s.opts.ConfigPath)
+		dirs := []string{
+			cfgDir,
+			path.Join(cfgDir, "cfglogdb"),
+			path.Join(cfgDir, "cfglogdb", "shard000"),
+		}
+		for _, d := range dirs {
+			if info, err := os.Stat(d); err == nil && info.IsDir() && info.Mode().Perm()&0200 == 0 {
+				return errors.New("clusterconfig storage directory is read-only: " + d)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) initRaft() error {
 	var raftConfig rafttypes.Config
 	if s.config.isInitialized() {
@@ -126,23 +148,34 @@ func (s *Server) initRaft() error {
 		}
 	}
 
-	s.raft = raft.New(raft.NewOptions(
+	r := raft.New(raft.NewOptions(
 		raft.WithKey("clusterconfig"),
 		raft.WithNodeId(s.opts.NodeId),
 		raft.WithTransport(newRaftTransport(s)),
 		raft.WithStorage(s.storage),
 		raft.WithElectionOn(true),
 	))
-	s.raft.Step(rafttypes.Event{
+	r.Step(rafttypes.Event{
 		Type:   rafttypes.ConfChange,
 		Config: raftConfig,
 	})
+	s.raftMu.Lock()
+	s.raft = r
+	s.raftMu.Unlock()
 
 	return nil
 }
 
+func (s *Server) getRaft() *raft.Raft {
+	s.raftMu.RLock()
+	defer s.raftMu.RUnlock()
+	return s.raft
+}
+
 func (s *Server) Stop() {
-	s.raft.Stop()
+	if r := s.getRaft(); r != nil {
+		r.Stop()
+	}
 	s.storage.Close()
 }
 
@@ -187,20 +220,22 @@ func (s *Server) ProposeBatchUntilAppliedTimeout(ctx context.Context, reqs []raf
 }
 
 func (s *Server) StepRaftEvent(e rafttypes.Event) {
-	if s.raft == nil {
+	r := s.getRaft()
+	if r == nil {
 		return
 	}
-	s.raft.Step(e)
+	r.Step(e)
 }
 
 func (s *Server) switchConfig(cfg *Config) error {
-	if s.raft == nil {
+	r := s.getRaft()
+	if r == nil {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := s.raft.StepWait(ctx, rafttypes.Event{
+	err := r.StepWait(ctx, rafttypes.Event{
 		Type:   rafttypes.ConfChange,
 		Config: s.configToRaftConfig(cfg),
 	})
@@ -214,24 +249,28 @@ func (s *Server) switchConfig(cfg *Config) error {
 }
 
 func (s *Server) IsLeader() bool {
-	if s.raft == nil {
+	r := s.getRaft()
+	if r == nil {
 		return false
 	}
-	return s.raft.IsLeader()
+	return r.IsLeader()
 }
 
 func (s *Server) LeaderId() uint64 {
-	if s.raft == nil {
+	r := s.getRaft()
+	if r == nil {
 		return 0
 	}
-	return s.raft.LeaderId()
+	return r.LeaderId()
 }
 
 func (s *Server) GetClusterConfig() *types.Config {
+	s.config.mu.RLock()
+	defer s.config.mu.RUnlock()
 	if s.config.cfg == nil {
 		return nil
 	}
-	return s.config.cfg
+	return s.config.cfg.Clone()
 }
 
 // 是否已初始化

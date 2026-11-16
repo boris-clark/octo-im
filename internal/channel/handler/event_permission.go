@@ -18,6 +18,9 @@ func (h *Handler) permission(ctx *eventbus.ChannelContext) {
 	for _, event := range events {
 		event.Track.Record(track.PositionChannelPermission)
 	}
+	if service.Permission == nil {
+		return
+	}
 
 	// --------------- 判断频道权限 ----------------
 	reasonCode, err := service.Permission.HasPermissionForChannel(channelId, channelType)

@@ -1,9 +1,12 @@
 package service
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -52,9 +55,46 @@ func (p *PermissionService) IsPublicChannelType(channelType uint8) bool {
 }
 
 // HasPermissionForChannel 检查频道级别的权限
-// 主要检查频道是否被封禁或解散
+// 主要检查频道是否被封禁或解散（集群模式下向频道所属槽领导节点查询权威状态）
 func (p *PermissionService) HasPermissionForChannel(channelId string, channelType uint8) (wkproto.ReasonCode, error) {
 	// 检查是否为公开频道类型
+	if p.IsPublicChannelType(channelType) {
+		return wkproto.ReasonSuccess, nil
+	}
+
+	if options.G != nil && options.G.ClusterOn() && Cluster != nil {
+		var (
+			leaderNode *types.Node
+			slotErr    error
+			panicked   bool
+		)
+		func() {
+			defer func() {
+				if recover() != nil {
+					panicked = true
+				}
+			}()
+			leaderNode, slotErr = Cluster.SlotLeaderOfChannel(channelId, channelType)
+		}()
+		if !panicked {
+			if slotErr != nil {
+				p.Error("HasPermissionForChannel: SlotLeaderOfChannel error", zap.Error(slotErr), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
+				return wkproto.ReasonSystemError, slotErr
+			}
+			if leaderNode == nil || leaderNode.Id == 0 {
+				return wkproto.ReasonSystemError, errors.New("slot leader not found")
+			}
+			if !options.G.IsLocalNode(leaderNode.Id) {
+				return p.requestChannelPermissionFromNode(leaderNode.Id, channelId, channelType)
+			}
+		}
+	}
+
+	return p.HasPermissionForChannelLocal(channelId, channelType)
+}
+
+// HasPermissionForChannelLocal 检查本节点上的频道级别权限（仅在槽领导节点或单机模式下直接读取本地存储）
+func (p *PermissionService) HasPermissionForChannelLocal(channelId string, channelType uint8) (wkproto.ReasonCode, error) {
 	if p.IsPublicChannelType(channelType) {
 		return wkproto.ReasonSuccess, nil
 	}
@@ -75,6 +115,31 @@ func (p *PermissionService) HasPermissionForChannel(channelId string, channelTyp
 		return wkproto.ReasonDisband, nil
 	}
 	return wkproto.ReasonSuccess, nil
+}
+
+func (p *PermissionService) requestChannelPermissionFromNode(toNodeId uint64, channelId string, channelType uint8) (wkproto.ReasonCode, error) {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteString(channelId)
+	enc.WriteUint8(channelType)
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := Cluster.RequestWithContext(timeoutCtx, toNodeId, "/wk/ingress/hasPermissionForChannel", enc.Bytes())
+	if err != nil {
+		p.Error("HasPermissionForChannel RPC call failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Uint64("nodeId", toNodeId))
+		return wkproto.ReasonSystemError, err
+	}
+	if resp == nil {
+		return wkproto.ReasonSystemError, errors.New("empty permission response")
+	}
+	if resp.Status == proto.StatusOK {
+		return wkproto.ReasonSuccess, nil
+	}
+	if resp.Status == proto.StatusError {
+		return wkproto.ReasonSystemError, errors.New(string(resp.Body))
+	}
+	return wkproto.ReasonCode(resp.Status), nil
 }
 
 // HasPermissionForSender 检查发送者权限

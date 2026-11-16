@@ -34,7 +34,18 @@ func NewServer(opts *Options) *Server {
 		Log:  wklog.NewWKLog("slot.Server"),
 	}
 	s.storage = NewPebbleShardLogStorage(s, path.Join(opts.DataDir, "logdb"), uint32(opts.SlotDbShardNum))
-	s.raftGroup = raftgroup.New(raftgroup.NewOptions(raftgroup.WithLogPrefix("slot"), raftgroup.WithStorage(s.storage), raftgroup.WithTransport(opts.Transport)))
+	rgOpts := []raftgroup.Option{
+		raftgroup.WithLogPrefix("slot"),
+		raftgroup.WithStorage(s.storage),
+		raftgroup.WithTransport(opts.Transport),
+	}
+	if opts.MaxLogSizePerBatch > 0 {
+		rgOpts = append(rgOpts, raftgroup.WithMaxLogSizePerBatch(opts.MaxLogSizePerBatch))
+	}
+	if opts.MaxLogCountPerBatch > 0 {
+		rgOpts = append(rgOpts, raftgroup.WithMaxLogCountPerBatch(opts.MaxLogCountPerBatch))
+	}
+	s.raftGroup = raftgroup.New(raftgroup.NewOptions(rgOpts...))
 	var err error
 	s.genLogId, err = snowflake.NewNode(int64(opts.NodeId))
 	if err != nil {
@@ -152,4 +163,32 @@ func (s *Server) GetSlotRaft(slotId uint32) *Slot {
 func (s *Server) GetLogsInReverseOrder(slotId uint32, startLogIndex uint64, endLogIndex uint64, limit int) ([]types.Log, error) {
 	shardNo := SlotIdToKey(slotId)
 	return s.storage.GetLogsInReverseOrder(shardNo, startLogIndex, endLogIndex, limit)
+}
+
+func (s *Server) GetLogsRange(slotId uint32, fromLogIndex uint64, toLogIndex uint64) ([]types.Log, error) {
+	if fromLogIndex == 0 {
+		fromLogIndex = 1
+	}
+	if toLogIndex < fromLogIndex {
+		return nil, nil
+	}
+	shardNo := SlotIdToKey(slotId)
+	var all []types.Log
+	cur := fromLogIndex
+	for cur <= toLogIndex {
+		logs, err := s.storage.GetLogs(shardNo, cur, toLogIndex+1, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(logs) == 0 {
+			break
+		}
+		all = append(all, logs...)
+		last := logs[len(logs)-1].Index
+		if last < cur {
+			break
+		}
+		cur = last + 1
+	}
+	return all, nil
 }

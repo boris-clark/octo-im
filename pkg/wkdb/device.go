@@ -261,7 +261,7 @@ func (wk *wukongDB) SearchDevice(req DeviceSearchReq) ([]Device, error) {
 		}
 		if has { // 如果有触发索引，则无需全局查询
 			allDevices = append(allDevices, devices...)
-			continue
+			break
 		}
 
 		start := uint64(req.OffsetCreatedAt)

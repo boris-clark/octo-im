@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
 	"github.com/WuKongIM/WuKongIM/internal/options"
@@ -75,12 +76,18 @@ func (u *channelHandler) events() []*eventbus.Event {
 	if len(events) == 0 {
 		return nil
 	}
-	eventLastIndex := events[len(events)-1].Index
-
-	// 截取掉之前的事件
-	u.pending.eventQueue.TruncateTo(eventLastIndex + 1)
-	u.processingIndex = eventLastIndex
+	u.lastActive = fasttime.UnixTimestamp()
 	return events
+}
+
+func (u *channelHandler) completeEvents(eventLastIndex uint64) {
+	u.pending.Lock()
+	defer u.pending.Unlock()
+	if eventLastIndex > u.processingIndex {
+		u.pending.eventQueue.TruncateTo(eventLastIndex + 1)
+		u.processingIndex = eventLastIndex
+	}
+	u.lastActive = fasttime.UnixTimestamp()
 }
 
 // 推进事件
@@ -88,8 +95,15 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 
 	c.processing.Store(true)
 	defer func() {
+		c.pending.Lock()
+		c.lastActive = fasttime.UnixTimestamp()
+		c.pending.Unlock()
 		c.processing.Store(false)
 	}()
+	if len(events) == 0 {
+		return
+	}
+	eventLastIndex := events[len(events)-1].Index
 
 	// 检查和更新leaderId
 	err := c.checkAndUpdateLeaderIdChange()
@@ -98,16 +112,21 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		c.slotLeaderId = 0
 	}
 
+	var deferredSends []*eventbus.Event
 	// 按类型分组
 	group := c.groupByType(events)
 	// 处理事件
-	for eventType, events := range group {
+	for eventType, grpEvents := range group {
+		if c.slotLeaderId == 0 && eventType == eventbus.EventChannelOnSend {
+			deferredSends = append(deferredSends, grpEvents...)
+			continue
+		}
 		// 从对象池中获取上下文
 		ctx := c.poller.getContext()
 		ctx.ChannelId = c.channelId
 		ctx.ChannelType = c.channelType
 		ctx.EventType = eventType
-		ctx.Events = events
+		ctx.Events = grpEvents
 		ctx.SlotLeaderId = c.slotLeaderId
 		// 处理事件
 		c.handler.OnEvent(ctx)
@@ -116,8 +135,27 @@ func (c *channelHandler) advanceEvents(events []*eventbus.Event) {
 		c.poller.putContext(ctx)
 	}
 
+	c.completeEvents(eventLastIndex)
+
+	if len(deferredSends) > 0 {
+		for _, ev := range deferredSends {
+			if ev != nil {
+				c.addEvent(ev)
+			}
+		}
+		time.AfterFunc(25*time.Millisecond, func() {
+			if c.poller != nil {
+				c.poller.advance()
+			}
+		})
+		return
+	}
+
 	// 推进事件
-	if c.pending.eventQueue.Len() > 0 {
+	c.pending.RLock()
+	hasMore := c.processingIndex < c.pending.eventQueue.LastIndex()
+	c.pending.RUnlock()
+	if hasMore || (c.poller != nil && c.poller.needAdvance.Swap(false)) {
 		c.poller.advance()
 	}
 }
@@ -141,7 +179,17 @@ func (c *channelHandler) checkAndUpdateLeaderIdChange() error {
 
 // isTimeout 判断用户是否超时
 func (c *channelHandler) isTimeout() bool {
-	now, lastActive := fasttime.UnixTimestamp(), c.lastActive
+	if c.processing.Load() {
+		return false
+	}
+	c.pending.RLock()
+	hasPending := c.pending.eventQueue != nil && (c.processingIndex < c.pending.eventQueue.LastIndex() || c.pending.eventQueue.Len() > 0)
+	lastActive := c.lastActive
+	c.pending.RUnlock()
+	if hasPending {
+		return false
+	}
+	now := fasttime.UnixTimestamp()
 	// Avoid unsigned underflow when the wall clock moves backwards.
 	return now > lastActive && now-lastActive > uint64(options.G.Poller.ChannelTimeout.Seconds())
 }

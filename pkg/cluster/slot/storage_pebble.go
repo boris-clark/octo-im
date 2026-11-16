@@ -1,11 +1,13 @@
 package slot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -67,11 +69,20 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 		sz = sz * levelSizeMultiplier
 		lopts = append(lopts, opt)
 	}
+	memTableSize := 16 * 1024 * 1024
+	var blockCache *pebble.Cache
+	if p.s != nil && p.s.opts != nil {
+		if p.s.opts.SlotMemTableSize > 0 {
+			memTableSize = p.s.opts.SlotMemTableSize
+		}
+		blockCache = p.s.opts.BlockCache
+	}
 	return &pebble.Options{
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
+		Cache:              blockCache,
 		// 控制写缓冲区的大小。较大的写缓冲区可以减少磁盘写入次数，但会占用更多内存。
-		MemTableSize: 128 * 1024 * 1024,
+		MemTableSize: memTableSize,
 		// 当队列中的MemTables的大小超过 MemTableStopWritesThreshold*MemTableSize 时，将停止写入，
 		// 直到被刷到磁盘，这个值不能小于2
 		MemTableStopWritesThreshold: 4,
@@ -84,12 +95,23 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 }
 
 func (p *PebbleShardLogStorage) Open() error {
+	if err := wkdb.ValidatePebbleShardDir(p.path, int(p.shardNum)); err != nil {
+		return err
+	}
 
+	p.dbs = nil
+	p.batchDbs = nil
 	opts := p.defaultPebbleOptions()
 
 	for i := 0; i < int(p.shardNum); i++ {
 		db, err := pebble.Open(fmt.Sprintf("%s/shard%03d", p.path, i), opts)
 		if err != nil {
+			for _, bdb := range p.batchDbs {
+				bdb.Stop()
+			}
+			for _, openDB := range p.dbs {
+				_ = openDB.Close()
+			}
 			return err
 		}
 		p.dbs = append(p.dbs, db)
@@ -114,6 +136,29 @@ func (p *PebbleShardLogStorage) Close() error {
 
 	p.stopper.Stop()
 
+	return nil
+}
+
+// CheckWriteHealth verifies that all local slot Pebble shards are open and their directories remain writable.
+func (p *PebbleShardLogStorage) CheckWriteHealth() error {
+	if p == nil {
+		return errors.New("slot storage is nil")
+	}
+	if len(p.dbs) == 0 || len(p.dbs) < int(p.shardNum) {
+		return errors.New("slot storage shards not open")
+	}
+	if info, err := os.Stat(p.path); err == nil && info.IsDir() && info.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("slot storage directory %s is read-only (mode=%v)", p.path, info.Mode().Perm())
+	}
+	for i, db := range p.dbs {
+		if db == nil {
+			return fmt.Errorf("slot storage shard[%d] is nil", i)
+		}
+		shardDir := fmt.Sprintf("%s/shard%03d", p.path, i)
+		if info, err := os.Stat(shardDir); err == nil && info.IsDir() && info.Mode().Perm()&0200 == 0 {
+			return fmt.Errorf("slot storage shard directory %s is read-only (mode=%v)", shardDir, info.Mode().Perm())
+		}
+	}
 	return nil
 }
 
@@ -232,10 +277,6 @@ func (p *PebbleShardLogStorage) AppendLogs(shardNo string, logs []types.Log, ter
 
 // TruncateLogTo 截断日志
 func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) error {
-	if index == 0 {
-		return errors.New("index must be greater than 0")
-	}
-
 	// 加锁保护，防止与 Apply 并发执行导致 appliedIndex > lastLogIndex
 	lock := p.slotLock(shardNo)
 	lock.Lock()
@@ -257,8 +298,7 @@ func (p *PebbleShardLogStorage) TruncateLogTo(shardNo string, index uint64) erro
 		return err
 	}
 	if index < appliedIdx {
-		p.Foucs("applied must be less than index", zap.Uint64("index", index), zap.Uint64("appliedIdx", appliedIdx), zap.Uint64("lastIndex", lastIndex), zap.String("shardNo", shardNo))
-		return nil
+		return types.ErrCommittedLogConflict
 	}
 
 	keyData := key.NewLogKey(shardNo, index+1)
@@ -309,6 +349,10 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 	defer iter.Close()
 	var logs []types.Log
 
+	var maxCount uint64
+	if p.s != nil && p.s.opts != nil && p.s.opts.MaxLogCountPerBatch > 0 {
+		maxCount = p.s.opts.MaxLogCountPerBatch
+	}
 	var size uint64
 	for iter.First(); iter.Valid(); iter.Next() {
 
@@ -327,13 +371,21 @@ func (p *PebbleShardLogStorage) GetLogs(shardNo string, startLogIndex uint64, en
 			return nil, err
 		}
 		log.Time = time.Unix(0, int64(tm))
+		logSize := uint64(log.LogSize())
+		if len(logs) > 0 && limitSize != 0 && size+logSize > limitSize {
+			break
+		}
 		logs = append(logs, log)
-		size += uint64(log.LogSize())
-		if limitSize != 0 && size >= limitSize {
+		size += logSize
+		if (limitSize != 0 && size >= limitSize) || (limitSize != 0 && maxCount > 0 && uint64(len(logs)) >= maxCount) {
 			break
 		}
 	}
 	return logs, nil
+}
+
+func sameLog(a, b types.Log) bool {
+	return a.Index == b.Index && a.Term == b.Term && a.Id == b.Id && bytes.Equal(a.Data, b.Data)
 }
 
 func (p *PebbleShardLogStorage) Apply(shardNo string, logs []types.Log) error {

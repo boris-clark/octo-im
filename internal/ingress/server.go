@@ -32,6 +32,8 @@ func (i *Ingress) SetRoutes() {
 	service.Cluster.Route("/wk/ingress/getTag", i.handleGetTag)
 	// 判断接受者是否允许发送消息
 	service.Cluster.Route("/wk/ingress/allowSend", i.handleAllowSend)
+	// 判断频道是否允许发送消息（封禁/解散检查）
+	service.Cluster.Route("/wk/ingress/hasPermissionForChannel", i.handleHasPermissionForChannel)
 	// 更新tag
 	service.Cluster.Route("/wk/ingress/updateTag", i.handleUpdateTag)
 	// 添加tag
@@ -153,6 +155,30 @@ func (i *Ingress) handleAllowSend(ctx *wkserver.Context) {
 		return
 	}
 	ctx.WriteErrorAndStatus(errors.New("not allow send"), proto.Status(reasonCode))
+}
+
+func (i *Ingress) handleHasPermissionForChannel(ctx *wkserver.Context) {
+	req := &ChannelReq{}
+	if err := req.Decode(ctx.Body()); err != nil {
+		i.Error("handleHasPermissionForChannel decode err", zap.Error(err))
+		ctx.WriteErr(err)
+		return
+	}
+	if service.Permission == nil {
+		ctx.WriteOk()
+		return
+	}
+	reasonCode, err := service.Permission.HasPermissionForChannelLocal(req.ChannelId, req.ChannelType)
+	if err != nil {
+		i.Error("handleHasPermissionForChannel failed", zap.Error(err), zap.String("channelId", req.ChannelId), zap.Uint8("channelType", req.ChannelType))
+		ctx.WriteErr(err)
+		return
+	}
+	if reasonCode == wkproto.ReasonSuccess {
+		ctx.WriteOk()
+		return
+	}
+	ctx.WriteErrorAndStatus(errors.New("channel permission denied"), proto.Status(reasonCode))
 }
 
 func (i *Ingress) handleUpdateTag(c *wkserver.Context) {

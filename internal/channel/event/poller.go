@@ -3,6 +3,7 @@ package event
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -29,6 +30,7 @@ type poller struct {
 
 	contextPool *sync.Pool
 	advanceC    chan struct{}
+	needAdvance atomic.Bool
 }
 
 func newPoller(index int, eventPool *EventPool) *poller {
@@ -123,7 +125,8 @@ func (p *poller) handleEvents() {
 			})
 			if err != nil {
 				h.processing.Store(false)
-				p.Error("submit channel handle task failed", zap.String("error", err.Error()))
+				p.needAdvance.Store(true)
+				break
 			}
 		}
 	}

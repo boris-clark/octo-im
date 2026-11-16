@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/common"
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -11,6 +13,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/service"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
 )
 
@@ -77,6 +80,58 @@ func (h *Handler) notForwardToLeader(eventType eventbus.EventType) bool {
 
 }
 
+func canForwardChannelSendBatch(events []*eventbus.Event) bool {
+	if forward.OnlyRetryableSends(events) {
+		return true
+	}
+	if len(events) == 0 {
+		return false
+	}
+	for _, event := range events {
+		if event == nil || event.Conn == nil || event.Type != eventbus.EventChannelOnSend {
+			return false
+		}
+		packet, ok := event.Frame.(*wkproto.SendPacket)
+		if !ok || packet == nil || strings.TrimSpace(packet.ClientMsgNo) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func hasPersistedEvents(events []*eventbus.Event) bool {
+	for _, event := range events {
+		if event != nil && event.MessageSeq > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func requeuePersistedForwardFailures(channelId string, channelType uint8, events []*eventbus.Event) {
+	if eventbus.Channel == nil {
+		return
+	}
+	requeued := false
+	for _, ev := range events {
+		if ev == nil || ev.MessageSeq == 0 || ev.ForwardHops >= 8 {
+			continue
+		}
+		clone := ev.Clone()
+		clone.ForwardHops = ev.ForwardHops + 1
+		clone.ForwardDeadline = 0
+		eventbus.Channel.AddEvent(channelId, channelType, clone)
+		requeued = true
+	}
+	if requeued {
+		time.AfterFunc(25*time.Millisecond, func() {
+			if eventbus.Channel != nil {
+				eventbus.Channel.Advance(channelId, channelType)
+			}
+		})
+	}
+}
+
 func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType uint8, events []*eventbus.Event) {
 
 	req := &forwardChannelEventReq{
@@ -94,22 +149,29 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	legacy := func(targetNode uint64) error {
 		return h.sendToNode(targetNode, &proto.Message{MsgType: uint32(msgForwardChannelEvent), Content: data})
 	}
-	if !forward.OnlyRetryableSends(events) {
+	persistedBatch := hasPersistedEvents(events)
+	if !canForwardChannelSendBatch(events) {
 		// Distribution and webhook work has no client-side retry path. Keep it
 		// out of the v1 ambiguity window and retain it in the base transport.
 		if err = legacy(nodeId); err != nil {
 			h.Error("channel forwarding through retained transport failed", zap.Error(err), zap.String("channelId", channelId))
 			forward.Fail(events, err)
+			if persistedBatch {
+				requeuePersistedForwardFailures(channelId, channelType, events)
+			}
 		}
 		return
 	}
-	if !h.forwardGate.TryAcquire() {
+	acquiredGate := h.forwardGate.TryAcquire()
+	if !acquiredGate && !persistedBatch {
 		err = forward.ErrUnavailable
 		h.Error("channel forwarding concurrency limit reached", zap.Error(err), zap.String("channelId", channelId))
 		forward.Fail(events, err)
 		return
 	}
-	defer h.forwardGate.Release()
+	if acquiredGate {
+		defer h.forwardGate.Release()
+	}
 	target := func() uint64 {
 		if len(events) > 0 && h.notForwardToLeader(events[0].Type) {
 			return nodeId
@@ -124,6 +186,9 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 	if err != nil {
 		h.Error("channel forwarding failed", zap.Error(err), zap.String("channelId", channelId))
 		forward.Fail(events, err)
+		if persistedBatch {
+			requeuePersistedForwardFailures(channelId, channelType, events)
+		}
 	}
 }
 
@@ -132,8 +197,7 @@ func (h *Handler) forwardsToNode(nodeId uint64, channelId string, channelType ui
 // }
 
 func (h *Handler) sendToNode(toNodeId uint64, msg *proto.Message) error {
-	err := service.Cluster.Send(toNodeId, msg)
-	return err
+	return service.Cluster.Send(toNodeId, msg)
 }
 
 // 收到转发用户事件
